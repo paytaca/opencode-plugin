@@ -72,12 +72,6 @@ OpenCode → localhost:8001 (proxy) → api.paytaca.ai
 
 The proxy is a detached Node.js process with heartbeat monitoring. It auto-exits after 15 seconds without a heartbeat (when all editor windows close).
 
-## Model
-
-| ID | Context | Max Output |
-|---|---|---|
-| `deepseek-ai/DeepSeek-V4-Flash` | 128,000 tokens | 8,192 tokens |
-
 ## License
 
 MIT
