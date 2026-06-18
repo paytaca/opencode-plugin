@@ -14,7 +14,6 @@ An [OpenCode](https://opencode.ai) plugin that connects to **Paytaca AI** — a 
 
 - **Node.js** >= 20.0.0
 - **OpenCode** >= 1.0.0
-- **paytaca-cli** (`npm install -g paytaca-cli`)
 
 ## Installation
 
@@ -22,11 +21,7 @@ An [OpenCode](https://opencode.ai) plugin that connects to **Paytaca AI** — a 
 npm install opencode-plugin
 ```
 
-The `paytaca-cli` must be installed globally:
-
-```bash
-npm install -g paytaca-cli
-```
+The `paytaca-cli` is bundled as a dependency and installed automatically.
 
 ## Usage
 

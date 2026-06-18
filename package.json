@@ -4,6 +4,9 @@
   "description": "OpenCode plugin for Paytaca AI - BCH micropayment provider for DeepSeek V4 Flash",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "paytaca": "./bin/paytaca.js"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
