@@ -1,6 +1,6 @@
 # opencode-plugin
 
-An [OpenCode](https://opencode.ai) plugin that connects to **Paytaca AI** — a BCH (Bitcoin Cash) micropayment provider for **DeepSeek V4 Flash**.
+An [OpenCode](https://opencode.ai) plugin that connects to **Paytaca AI** — an AI inference provider powered by Bitcoin Cash micropayments.
 
 ## How it works
 

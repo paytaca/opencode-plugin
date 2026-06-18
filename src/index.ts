@@ -60,7 +60,7 @@ export default async function OpencodePlugin() {
     connect: {
       types: [{
         name: 'paytaca-ai',
-        description: 'Connect to Paytaca AI (BCH micropayments for DeepSeek V4 Flash)',
+        description: 'Connect to Paytaca AI (AI inference powered by Bitcoin Cash micropayments)',
         async connect() {
           return {
             provider: {
