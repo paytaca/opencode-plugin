@@ -1,41 +1,13 @@
-export default function OpencodePlugin(): Promise<{
-    connect: {
-        types: {
-            name: string;
-            description: string;
-            connect(): Promise<{
-                error: string;
-            }>;
-        }[];
-    };
-    onExit?: undefined;
+declare function OpencodePlugin(_input?: any, _options?: any): Promise<{
+    config?: undefined;
+    "chat.headers"?: undefined;
 } | {
-    connect: {
-        types: {
-            name: string;
-            description: string;
-            connect(): Promise<{
-                provider: {
-                    'paytaca-ai': {
-                        npm: string;
-                        name: string;
-                        options: {
-                            baseURL: string;
-                        };
-                        models: {
-                            'deepseek-ai/DeepSeek-V4-Flash': {
-                                name: string;
-                                limit: {
-                                    context: number;
-                                    output: number;
-                                };
-                            };
-                        };
-                    };
-                };
-            }>;
-        }[];
-    };
-    onExit(): Promise<void>;
+    config: (cfg: any) => Promise<void>;
+    "chat.headers": (_input: any, output: any) => Promise<void>;
 }>;
+declare const _default: {
+    id: string;
+    server: typeof OpencodePlugin;
+};
+export = _default;
 //# sourceMappingURL=index.d.ts.map

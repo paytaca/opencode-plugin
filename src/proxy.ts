@@ -144,11 +144,10 @@ export async function startProxy(configDir: string, config: Config): Promise<Pro
   // Write PID file
   fs.writeFileSync(pidFile, proxy.pid.toString());
   
-  // Update config - new proxy
-  const updatedConfig = loadConfig(configDir);
-  updatedConfig.proxyPort = port;
-  updatedConfig.proxyPid = proxy.pid;
-  saveConfig(configDir, updatedConfig);
+  // Update config - new proxy (preserve wallet hash from passed config)
+  config.proxyPort = port;
+  config.proxyPid = proxy.pid;
+  saveConfig(configDir, config);
   
   // Initialize heartbeat file
   const heartbeatFile = getHeartbeatFile(configDir);

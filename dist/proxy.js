@@ -156,11 +156,10 @@ async function startProxy(configDir, config) {
     }
     // Write PID file
     fs.writeFileSync(pidFile, proxy.pid.toString());
-    // Update config - new proxy
-    const updatedConfig = (0, config_1.loadConfig)(configDir);
-    updatedConfig.proxyPort = port;
-    updatedConfig.proxyPid = proxy.pid;
-    (0, config_1.saveConfig)(configDir, updatedConfig);
+    // Update config - new proxy (preserve wallet hash from passed config)
+    config.proxyPort = port;
+    config.proxyPid = proxy.pid;
+    (0, config_1.saveConfig)(configDir, config);
     // Initialize heartbeat file
     const heartbeatFile = (0, config_1.getHeartbeatFile)(configDir);
     fs.writeFileSync(heartbeatFile, Date.now().toString());

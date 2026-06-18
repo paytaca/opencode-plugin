@@ -18,6 +18,7 @@ exports.PROXY_SCRIPT_CONTENT = `#!/usr/bin/env node
  */
 
 const http = require('http');
+const https = require('https');
 const { spawn } = require('child_process');
 const { Transform } = require('stream');
 const fs = require('fs');
@@ -29,6 +30,7 @@ const BACKEND_URL = process.argv[2] || 'https://api.paytaca.ai';
 const parsedUrl = new URL(BACKEND_URL);
 const DJANGO_HOST = parsedUrl.hostname;
 const DJANGO_PORT = parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80);
+const REQUester = parsedUrl.protocol === 'https:' ? https : http;
 
 // Logging setup: write to file instead of console
 const LOG_DIR = path.join(os.homedir(), '.opencode-paytaca');
@@ -373,7 +375,7 @@ function forwardToDjango(req, body, callback) {
   const startTime = Date.now();
   log('forwardToDjango -> ' + options.method + ' ' + options.hostname + ':' + options.port + options.path);
 
-  const djangoReq = http.request(options, (djangoRes) => {
+  const djangoReq = REQUester.request(options, (djangoRes) => {
     let responseBody = '';
     djangoRes.on('data', chunk => { responseBody += chunk; });
     djangoRes.on('end', () => {
@@ -414,7 +416,7 @@ function forwardStreaming(req, res, body, callback) {
   const startTime = Date.now();
   log('forwardStreaming -> ' + options.method + ' ' + options.hostname + ':' + options.port + options.path);
 
-  const djangoReq = http.request(options, (djangoRes) => {
+  const djangoReq = REQUester.request(options, (djangoRes) => {
     const elapsed = Date.now() - startTime;
     log('Django response started in ' + elapsed + 'ms: status=' + djangoRes.statusCode);
 
@@ -825,7 +827,7 @@ const server = http.createServer(async (req, res) => {
           
           try {
             const statusResponse = await new Promise((resolve, reject) => {
-              const statusReq = http.get({
+              const statusReq = REQUester.get({
                 hostname: DJANGO_HOST,
                 port: DJANGO_PORT,
                 path: '/v1/wallet/status',

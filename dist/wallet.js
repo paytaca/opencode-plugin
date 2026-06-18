@@ -41,14 +41,14 @@ exports.importWallet = importWallet;
 exports.extractWalletHash = extractWalletHash;
 exports.getReceivingAddress = getReceivingAddress;
 exports.getWalletBalance = getWalletBalance;
+const fs = __importStar(require("fs"));
 const util_1 = require("util");
 const path = __importStar(require("path"));
 const execAsync = (0, util_1.promisify)(require('child_process').exec);
 // Get the path to paytaca binary (local or global)
 function getPaytacaCommand() {
-    // When installed as dependency, paytaca-cli will be in our node_modules
     const localPaytaca = path.join(__dirname, '..', 'node_modules', '.bin', 'paytaca');
-    return localPaytaca;
+    return fs.existsSync(localPaytaca) ? localPaytaca : 'paytaca';
 }
 const PAYTACA_CMD = getPaytacaCommand();
 async function checkWallet() {
@@ -56,13 +56,16 @@ async function checkWallet() {
         const { stdout } = await execAsync(`"${PAYTACA_CMD}" wallet info`);
         const output = stdout.toString();
         // Extract wallet hash
-        const hashMatch = output.match(/Wallet hash:\\s*(.+)/i);
+        const hashMatch = output.match(/Wallet hash:\s*(.+)/i);
         const hash = hashMatch ? hashMatch[1].trim() : undefined;
+        if (!hash) {
+            return { exists: false };
+        }
         // Extract address
-        const addressMatch = output.match(/Address:\\s*(.+)/i);
+        const addressMatch = output.match(/Address:\s*(.+)/i);
         const address = addressMatch ? addressMatch[1].trim() : undefined;
         // Extract balance
-        const balanceMatch = output.match(/Balance:\\s*(.+)/i);
+        const balanceMatch = output.match(/Balance:\s*(.+)/i);
         const balance = balanceMatch ? balanceMatch[1].trim() : undefined;
         return {
             exists: true,
@@ -126,9 +129,9 @@ async function createWallet() {
             // Fall through to regex parsing
         }
         // Parse from text output
-        const hashMatch = output.match(/Wallet hash:\\s*(.+)/i);
-        const addressMatch = output.match(/Address:\\s*(.+)/i);
-        const mnemonicMatch = output.match(/Recovery phrase[\\s\\S]*?([a-z]+(?:\\s+[a-z]+){11,23})/i);
+        const hashMatch = output.match(/Wallet hash:\s*(.+)/i);
+        const addressMatch = output.match(/Address:\s*(.+)/i);
+        const mnemonicMatch = output.match(/Recovery phrase[\s\S]*?([a-z]+(?:\s+[a-z]+){11,23})/i);
         if (mnemonicMatch) {
             console.log('\\n⚠️  IMPORTANT: Your wallet has been created!');
             console.log('\\nSAVE THIS RECOVERY PHRASE SECURELY:');
@@ -179,8 +182,8 @@ async function importWallet(mnemonic) {
         // Import wallet using provided mnemonic
         const { stdout } = await execAsync(`echo "${mnemonic}" | "${PAYTACA_CMD}" wallet import --stdin`);
         const output = stdout.toString();
-        const hashMatch = output.match(/Wallet hash:\\s*(.+)/i);
-        const addressMatch = output.match(/Address:\\s*(.+)/i);
+        const hashMatch = output.match(/Wallet hash:\s*(.+)/i);
+        const addressMatch = output.match(/Address:\s*(.+)/i);
         return {
             exists: true,
             hash: hashMatch ? hashMatch[1].trim() : undefined,
@@ -196,14 +199,14 @@ async function importWallet(mnemonic) {
     }
 }
 function extractWalletHash(output) {
-    const match = output.match(/Wallet hash:\\s*(.+)/i);
+    const match = output.match(/Wallet hash:\s*(.+)/i);
     return match ? match[1].trim() : undefined;
 }
 async function getReceivingAddress() {
     try {
         const { stdout } = await execAsync(`"${PAYTACA_CMD}" wallet info`);
         const output = stdout.toString();
-        const addressMatch = output.match(/Address:\\s*(.+)/i);
+        const addressMatch = output.match(/Address:\s*(.+)/i);
         return addressMatch ? addressMatch[1].trim() : null;
     }
     catch {
@@ -214,7 +217,7 @@ async function getWalletBalance() {
     try {
         const { stdout } = await execAsync(`"${PAYTACA_CMD}" wallet info`);
         const output = stdout.toString();
-        const match = output.match(/Balance:\\s*([\\d.]+)\\s*BCH/i);
+        const match = output.match(/Balance:\s*([\d.]+)\s*BCH/i);
         if (match) {
             const bch = parseFloat(match[1]);
             return {
