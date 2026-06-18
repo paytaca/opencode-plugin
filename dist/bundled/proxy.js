@@ -166,8 +166,25 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     'Connection': 'keep-alive',
   });
 
-  const costSats = 6000;
-  const costBch = 0.00006;
+  // Fetch dynamic pricing from backend config
+  let costPhp = 10.00;
+  let costBch = '0.00080000';
+  let costSats = 80000;
+  let usingDefaultRate = false;
+  
+  try {
+    const configRes = await fetch(BACKEND_URL + '/v1/config');
+    if (configRes.ok) {
+      const config = await configRes.json();
+      costPhp = config.cost_php || 10.00;
+      costBch = config.cost_bch || '0.00080000';
+      costSats = config.cost_sats || 80000;
+    }
+  } catch (e) {
+    // Backend unreachable — will warn user below
+    usingDefaultRate = true;
+  }
+  
   const baseId = isRenewal ? 'renewal' : 'payment';
 
   sseLine(res, {
@@ -187,9 +204,9 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     hasWallet = hasCli ? await checkWallet() : false;
     balanceSats = hasWallet ? await getWalletBalance() : null;
     if (balanceSats !== null) {
-      balanceStr = (balanceSats / 100000000).toFixed(8) + ' BCH (' + balanceSats.toLocaleString() + ' sats)';
+      balanceStr = (balanceSats / 100000000).toFixed(8) + ' BCH';
     } else {
-      balanceStr = 'Unable to check';
+      balanceStr = 'Unable to check (try restarting)';
     }
   } else {
     // First-time users: show full loading sequence
@@ -231,14 +248,14 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     });
 
     if (balanceSats !== null) {
-      balanceStr = (balanceSats / 100000000).toFixed(8) + ' BCH (' + balanceSats.toLocaleString() + ' sats)';
+      balanceStr = (balanceSats / 100000000).toFixed(8) + ' BCH';
       sseLine(res, {
         id: baseId + '-8',
         object: 'chat.completion.chunk',
         choices: [{ index: 0, delta: { content: '✅\\n\\n' }, finish_reason: null }],
       });
     } else {
-      balanceStr = 'Unable to check';
+      balanceStr = 'Unable to check (try restarting)';
       sseLine(res, {
         id: baseId + '-8',
         object: 'chat.completion.chunk',
@@ -260,8 +277,16 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
   sseLine(res, {
     id: baseId + '-10',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Cost: ' + costBch + ' BCH (' + costSats.toLocaleString() + ' sats)\\n' }, finish_reason: null }],
+    choices: [{ index: 0, delta: { content: 'Cost: ' + costPhp.toFixed(2) + ' PHP (~' + costBch + ' BCH)\\n' }, finish_reason: null }],
   });
+  
+  if (usingDefaultRate) {
+    sseLine(res, {
+      id: baseId + '-10b',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: '⚠️ Could not reach backend for live pricing. Using default rate.\\n' }, finish_reason: null }],
+    });
+  }
   
   if (isRenewal) {
     const unusedTokens = Math.max(0, tokenLimit - tokensUsed);
@@ -299,7 +324,7 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     sseLine(res, {
       id: baseId + '-14',
       object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Sessions Affordable: ~' + affordable + '\\n\\n' }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: 'You could afford about ~' + affordable + ' sessions\\n\\n' }, finish_reason: null }],
     });
   }
   
