@@ -54,7 +54,7 @@ function findPaytacaCliPath() {
     } catch {}
   }
   
-  throw new Error('paytaca-cli not found. Please install: npm install -g paytaca-cli');
+  throw new Error('paytaca-cli not found. Try reinstalling opencode-plugin: npm install @paytaca/opencode-plugin');
 }
 
 // Load paytaca-cli modules
