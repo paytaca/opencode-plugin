@@ -18,7 +18,7 @@ export default async function OpencodePlugin() {
           description: 'Connect to Paytaca AI (requires paytaca-cli)',
           async connect() {
             return {
-              error: `paytaca-cli could not be found. This is unexpected — try reinstalling opencode-plugin:\n\n  npm install opencode-plugin\n\nIf the issue persists, run:\n\n  npm install -g paytaca-cli`
+              error: `paytaca-cli could not be found. This is unexpected — try reinstalling opencode-plugin:\n\n  npm install @paytaca/opencode-plugin\n\nIf the issue persists, run:\n\n  npm install -g paytaca-cli`
             };
           }
         }]

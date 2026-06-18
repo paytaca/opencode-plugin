@@ -18,7 +18,7 @@ An [OpenCode](https://opencode.ai) plugin that connects to **Paytaca AI** — a 
 ## Installation
 
 ```bash
-npm install opencode-plugin
+npm install @paytaca/opencode-plugin
 ```
 
 The `paytaca-cli` is bundled as a dependency and installed automatically.
