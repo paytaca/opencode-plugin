@@ -47,7 +47,7 @@ paytaca wallet info
 paytaca wallet import
 
 # Get receiving address
-paytaca receive --no-qr
+paytaca receive
 ```
 
 ## Configuration
