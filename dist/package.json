@@ -1,5 +1,5 @@
 {
-  "name": "opencode-plugin",
+  "name": "@paytaca/opencode-plugin",
   "version": "0.1.0",
   "description": "OpenCode plugin for Paytaca AI - BCH micropayment provider for DeepSeek V4 Flash",
   "main": "index.js",
@@ -36,5 +36,8 @@
     "opencode": {
       "optional": true
     }
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
