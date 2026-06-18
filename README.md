@@ -64,12 +64,24 @@ Override via `PAYTACA_BACKEND_URL` environment variable (highest priority).
 ## Architecture
 
 ```
-OpenCode → localhost:8001 (proxy) → api.paytaca.ai
-                         ↕
-              paytaca-cli (wallet / x402)
+┌──────────┐    LLM request     ┌──────────────┐     forward     ┌─────────────────┐
+│  OpenCode │ ─────────────────→ │  Proxy       │ ──────────────→ │  Paytaca API    │
+│           │                    │  localhost   │                 │  api.paytaca.ai │
+│  (editor) │ ←──────────────── │  :8001-8010  │ ←────────────── │                 │
+└──────────┘    response        └──────┬───────┘    response     └─────────────────┘
+                                       │
+                              ┌────────▼────────┐
+                              │  402 Payment    │
+                              │  intercepted    │
+                              └────────┬────────┘
+                                       │
+                              ┌────────▼────────┐
+                              │  paytaca-cli    │
+                              │  (wallet/x402)  │
+                              └─────────────────┘
 ```
 
-The proxy is a detached Node.js process with heartbeat monitoring. It auto-exits after 15 seconds without a heartbeat (when all editor windows close).
+The proxy runs as a detached Node.js process with heartbeat monitoring. It auto-exits after 15 seconds without a heartbeat (when all editor windows close).
 
 ## License
 
