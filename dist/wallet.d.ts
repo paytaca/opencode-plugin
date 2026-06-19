@@ -1,5 +1,6 @@
 import { WalletInfo } from './types';
 export declare function checkWallet(): Promise<WalletInfo>;
+export declare function ensurePaytacaOnPath(): string | null;
 export declare function checkPaytacaCli(): Promise<boolean>;
 export declare function createWallet(): Promise<WalletInfo>;
 export declare function ensureWallet(): Promise<WalletInfo>;

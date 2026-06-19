@@ -1,5 +1,5 @@
 import { ensureConfigDir, getConfigDir, loadConfig, saveConfig } from './config';
-import { checkWallet, ensureWallet, checkPaytacaCli } from './wallet';
+import { checkWallet, ensureWallet, checkPaytacaCli, ensurePaytacaOnPath } from './wallet';
 import { startProxy } from './proxy';
 
 async function OpencodePlugin(_input?: any, _options?: any) {
@@ -7,6 +7,9 @@ async function OpencodePlugin(_input?: any, _options?: any) {
   ensureConfigDir(configDir);
 
   let config = loadConfig(configDir);
+
+  // Ensure paytaca binary is on PATH for internal use
+  ensurePaytacaOnPath();
 
   // Check if paytaca-cli is installed
   const hasPaytacaCli = await checkPaytacaCli();

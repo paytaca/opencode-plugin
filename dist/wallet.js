@@ -34,6 +34,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.checkWallet = checkWallet;
+exports.ensurePaytacaOnPath = ensurePaytacaOnPath;
 exports.checkPaytacaCli = checkPaytacaCli;
 exports.createWallet = createWallet;
 exports.ensureWallet = ensureWallet;
@@ -45,10 +46,17 @@ const fs = __importStar(require("fs"));
 const util_1 = require("util");
 const path = __importStar(require("path"));
 const execAsync = (0, util_1.promisify)(require('child_process').exec);
-// Get the path to paytaca binary (local or global)
 function getPaytacaCommand() {
+    try {
+        const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
+        return path.resolve(path.dirname(paytacaCliPkg), 'bin', 'paytaca.js');
+    }
+    catch { }
     const localPaytaca = path.join(__dirname, '..', 'node_modules', '.bin', 'paytaca');
-    return fs.existsSync(localPaytaca) ? localPaytaca : 'paytaca';
+    if (fs.existsSync(localPaytaca)) {
+        return localPaytaca;
+    }
+    return 'paytaca';
 }
 const PAYTACA_CMD = getPaytacaCommand();
 async function checkWallet() {
@@ -80,14 +88,23 @@ async function checkWallet() {
         };
     }
 }
+function ensurePaytacaOnPath() {
+    try {
+        const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
+        const binDir = path.resolve(path.dirname(paytacaCliPkg), '..', '.bin');
+        const paytacaBin = path.join(binDir, 'paytaca');
+        if (fs.existsSync(paytacaBin)) {
+            if (!process.env.PATH?.includes(binDir)) {
+                process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
+            }
+            return binDir;
+        }
+    }
+    catch { }
+    return null;
+}
 async function checkPaytacaCli() {
     try {
-        // Check if paytaca binary exists
-        const fs = require('fs');
-        if (!fs.existsSync(PAYTACA_CMD)) {
-            return false;
-        }
-        // Test if it runs
         await execAsync(`"${PAYTACA_CMD}" --version`);
         return true;
     }

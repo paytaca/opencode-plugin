@@ -6,10 +6,18 @@ import { WalletInfo } from './types';
 
 const execAsync = promisify(require('child_process').exec);
 
-// Get the path to paytaca binary (local or global)
 function getPaytacaCommand(): string {
+  try {
+    const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
+    return path.resolve(path.dirname(paytacaCliPkg), 'bin', 'paytaca.js');
+  } catch {}
+
   const localPaytaca = path.join(__dirname, '..', 'node_modules', '.bin', 'paytaca');
-  return fs.existsSync(localPaytaca) ? localPaytaca : 'paytaca';
+  if (fs.existsSync(localPaytaca)) {
+    return localPaytaca;
+  }
+
+  return 'paytaca';
 }
 
 const PAYTACA_CMD = getPaytacaCommand();
@@ -48,14 +56,23 @@ export async function checkWallet(): Promise<WalletInfo> {
   }
 }
 
+export function ensurePaytacaOnPath(): string | null {
+  try {
+    const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
+    const binDir = path.resolve(path.dirname(paytacaCliPkg), '..', '.bin');
+    const paytacaBin = path.join(binDir, 'paytaca');
+    if (fs.existsSync(paytacaBin)) {
+      if (!process.env.PATH?.includes(binDir)) {
+        process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
+      }
+      return binDir;
+    }
+  } catch {}
+  return null;
+}
+
 export async function checkPaytacaCli(): Promise<boolean> {
   try {
-    // Check if paytaca binary exists
-    const fs = require('fs');
-    if (!fs.existsSync(PAYTACA_CMD)) {
-      return false;
-    }
-    // Test if it runs
     await execAsync(`"${PAYTACA_CMD}" --version`);
     return true;
   } catch {

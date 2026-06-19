@@ -339,11 +339,13 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     }
   }
   
-  sseLine(res, {
-    id: baseId + '-16',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Approve payment? (yes/no)' }, finish_reason: 'stop' }],
-  });
+  if (balanceSats === null || balanceSats > 0) {
+    sseLine(res, {
+      id: baseId + '-16',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: 'Approve payment? (yes/no)' }, finish_reason: 'stop' }],
+    });
+  }
   
   sseLine(res, {
     id: baseId + '-17',
@@ -774,7 +776,7 @@ const server = http.createServer(async (req, res) => {
 
           const addr = await getReceivingAddress();
           const fundMsg = addr
-            ? 'Fund your wallet:\\n' + addr + '\\n\\nOr run: paytaca receive --no-qr'
+            ? 'Fund your wallet:\\n' + addr + '\\n\\nOr run: paytaca receive'
             : 'You can fund your wallet by running: paytaca receive --no-qr';
 
           const declineCompletion = {

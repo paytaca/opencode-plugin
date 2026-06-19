@@ -6,6 +6,8 @@ async function OpencodePlugin(_input, _options) {
     const configDir = (0, config_1.getConfigDir)();
     (0, config_1.ensureConfigDir)(configDir);
     let config = (0, config_1.loadConfig)(configDir);
+    // Ensure paytaca binary is on PATH for internal use
+    (0, wallet_1.ensurePaytacaOnPath)();
     // Check if paytaca-cli is installed
     const hasPaytacaCli = await (0, wallet_1.checkPaytacaCli)();
     if (!hasPaytacaCli) {
