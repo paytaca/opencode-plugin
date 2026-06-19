@@ -1,6 +1,6 @@
 {
   "name": "@paytaca/opencode-plugin",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenCode plugin for Paytaca AI - AI inference provider powered by Bitcoin Cash micropayments",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
