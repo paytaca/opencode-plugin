@@ -334,7 +334,7 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
       sseLine(res, {
         id: baseId + '-15',
         object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: '⚠️ Insufficient balance for a session.\\nFund your wallet: ' + addr + '\\n\\n' }, finish_reason: null }],
+        choices: [{ index: 0, delta: { content: '⚠️ Insufficient balance for a session.\\nFund your wallet: ' + addr + '\\nOr run: paytaca receive (in another terminal) for QR code\\n\\n' }, finish_reason: null }],
       });
     }
   }
@@ -776,8 +776,8 @@ const server = http.createServer(async (req, res) => {
 
           const addr = await getReceivingAddress();
           const fundMsg = addr
-            ? 'Fund your wallet:\\n' + addr + '\\n\\nOr run: paytaca receive'
-            : 'You can fund your wallet by running: paytaca receive --no-qr';
+            ? 'Fund your wallet: ' + addr
+            : 'You can fund your wallet by running: paytaca receive';
 
           const declineCompletion = {
             id: 'payment-declined',
