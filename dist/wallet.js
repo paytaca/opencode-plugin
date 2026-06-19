@@ -42,20 +42,65 @@ exports.importWallet = importWallet;
 exports.extractWalletHash = extractWalletHash;
 exports.getReceivingAddress = getReceivingAddress;
 exports.getWalletBalance = getWalletBalance;
+const child_process_1 = require("child_process");
 const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const util_1 = require("util");
 const path = __importStar(require("path"));
 const execAsync = (0, util_1.promisify)(require('child_process').exec);
+function getGlobalNpmRoot() {
+    try {
+        return (0, child_process_1.execSync)('npm root -g', { encoding: 'utf8' }).trim();
+    }
+    catch {
+        return null;
+    }
+}
 function getPaytacaCommand() {
+    // Priority 1: Local node_modules (via require.resolve)
     try {
         const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
         return path.resolve(path.dirname(paytacaCliPkg), 'bin', 'paytaca.js');
     }
     catch { }
+    // Priority 2: Local .bin symlink
     const localPaytaca = path.join(__dirname, '..', 'node_modules', '.bin', 'paytaca');
     if (fs.existsSync(localPaytaca)) {
         return localPaytaca;
     }
+    // Priority 3: Global npm root
+    const globalRoot = getGlobalNpmRoot();
+    if (globalRoot) {
+        const globalPaytaca = path.join(globalRoot, 'paytaca-cli', 'bin', 'paytaca.js');
+        if (fs.existsSync(globalPaytaca)) {
+            return globalPaytaca;
+        }
+        const scopedPaytaca = path.join(globalRoot, '@paytaca', 'opencode-plugin', 'node_modules', 'paytaca-cli', 'bin', 'paytaca.js');
+        if (fs.existsSync(scopedPaytaca)) {
+            return scopedPaytaca;
+        }
+    }
+    // Priority 4: Common global installation paths
+    const commonPaths = [
+        '/usr/lib/node_modules/paytaca-cli/bin/paytaca.js',
+        '/usr/local/lib/node_modules/paytaca-cli/bin/paytaca.js',
+        '/opt/homebrew/lib/node_modules/paytaca-cli/bin/paytaca.js',
+    ];
+    for (const p of commonPaths) {
+        if (fs.existsSync(p)) {
+            return p;
+        }
+    }
+    // Priority 5: which/where on PATH
+    try {
+        const which = process.platform === 'win32' ? 'where' : 'which';
+        const result = (0, child_process_1.execSync)(`${which} paytaca`, { encoding: 'utf8' }).trim().split('\n')[0];
+        if (result) {
+            return result;
+        }
+    }
+    catch { }
+    // Priority 6: Bare command (rely on PATH at runtime)
     return 'paytaca';
 }
 const PAYTACA_CMD = getPaytacaCommand();
@@ -88,19 +133,47 @@ async function checkWallet() {
         };
     }
 }
+function addToPath(dir) {
+    if (dir && fs.existsSync(dir) && !process.env.PATH?.includes(dir)) {
+        process.env.PATH = `${dir}${path.delimiter}${process.env.PATH}`;
+    }
+}
 function ensurePaytacaOnPath() {
+    // Priority 1: Local node_modules .bin dir
     try {
         const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
         const binDir = path.resolve(path.dirname(paytacaCliPkg), '..', '.bin');
         const paytacaBin = path.join(binDir, 'paytaca');
         if (fs.existsSync(paytacaBin)) {
-            if (!process.env.PATH?.includes(binDir)) {
-                process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
-            }
+            addToPath(binDir);
             return binDir;
         }
     }
     catch { }
+    // Priority 2: Global npm root .bin dir
+    const globalRoot = getGlobalNpmRoot();
+    if (globalRoot) {
+        const globalBinDir = path.resolve(globalRoot, '..', '.bin');
+        const globalPaytaca = path.join(globalBinDir, 'paytaca');
+        if (fs.existsSync(globalPaytaca)) {
+            addToPath(globalBinDir);
+            return globalBinDir;
+        }
+    }
+    // Priority 3: Common global bin directories
+    const commonBinDirs = [
+        '/usr/local/bin',
+        '/usr/bin',
+        path.join(os.homedir(), '.npm-global', 'bin'),
+        process.env.NVM_BIN,
+    ].filter((p) => !!p);
+    for (const binDir of commonBinDirs) {
+        const paytacaBin = path.join(binDir, 'paytaca');
+        if (fs.existsSync(paytacaBin)) {
+            addToPath(binDir);
+            return binDir;
+        }
+    }
     return null;
 }
 async function checkPaytacaCli() {

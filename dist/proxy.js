@@ -48,10 +48,55 @@ const proxy_1 = require("./bundled/proxy");
 const wrapper_1 = require("./bundled/wrapper");
 // Store heartbeat interval reference
 let heartbeatInterval = null;
-// Get path to local paytaca binary
+// Get path to paytaca binary (multi-strategy resolution)
 function getPaytacaCommand() {
+    // Priority 1: Local node_modules (via require.resolve)
+    try {
+        const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
+        return path.resolve(path.dirname(paytacaCliPkg), 'bin', 'paytaca.js');
+    }
+    catch { }
+    // Priority 2: Local .bin symlink
     const localPaytaca = path.join(__dirname, '..', 'node_modules', '.bin', 'paytaca');
-    return fs.existsSync(localPaytaca) ? localPaytaca : 'paytaca';
+    if (fs.existsSync(localPaytaca)) {
+        return localPaytaca;
+    }
+    // Priority 3: Global npm root
+    try {
+        const globalRoot = (0, child_process_1.execSync)('npm root -g', { encoding: 'utf8' }).trim();
+        const pathsToCheck = [
+            path.join(globalRoot, 'paytaca-cli', 'bin', 'paytaca.js'),
+            path.join(globalRoot, '@paytaca', 'opencode-plugin', 'node_modules', 'paytaca-cli', 'bin', 'paytaca.js'),
+        ];
+        for (const p of pathsToCheck) {
+            if (fs.existsSync(p)) {
+                return p;
+            }
+        }
+    }
+    catch { }
+    // Priority 4: Common global installation paths
+    const commonPaths = [
+        '/usr/lib/node_modules/paytaca-cli/bin/paytaca.js',
+        '/usr/local/lib/node_modules/paytaca-cli/bin/paytaca.js',
+        '/opt/homebrew/lib/node_modules/paytaca-cli/bin/paytaca.js',
+    ];
+    for (const p of commonPaths) {
+        if (fs.existsSync(p)) {
+            return p;
+        }
+    }
+    // Priority 5: which/where on PATH
+    try {
+        const which = process.platform === 'win32' ? 'where' : 'which';
+        const result = (0, child_process_1.execSync)(`${which} paytaca`, { encoding: 'utf8' }).trim().split('\n')[0];
+        if (result) {
+            return result;
+        }
+    }
+    catch { }
+    // Priority 6: Bare command (rely on PATH at runtime)
+    return 'paytaca';
 }
 async function isPortAvailable(port) {
     return new Promise((resolve) => {
