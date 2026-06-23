@@ -189,44 +189,32 @@ async function createWallet() {
     try {
         // Generate a new wallet using paytaca CLI
         // This will create a wallet and display the mnemonic
-        const { stdout, stderr } = await execAsync(`"${PAYTACA_CMD}" wallet create --json`);
+        const { stdout, stderr } = await execAsync(`"${PAYTACA_CMD}" wallet create`);
         let output = stdout.toString();
         if (!output && stderr) {
             output = stderr.toString();
         }
-        // Try to parse JSON output if available
-        try {
-            const jsonOutput = JSON.parse(output);
-            if (jsonOutput.mnemonic) {
-                // Show warning to user
-                console.log('\\n⚠️  IMPORTANT: Your wallet has been created!');
-                console.log('\\nSAVE THIS RECOVERY PHRASE SECURELY:');
-                console.log('═'.repeat(60));
-                console.log(jsonOutput.mnemonic);
-                console.log('═'.repeat(60));
-                console.log('\\nWithout this phrase, you CANNOT recover your funds if you');
-                console.log('lose access to this device. Write it down and store it safely.\\n');
-                return {
-                    exists: true,
-                    hash: jsonOutput.hash,
-                    address: jsonOutput.address,
-                    balance: '0 BCH',
-                    mnemonic: jsonOutput.mnemonic
-                };
-            }
-        }
-        catch {
-            // Fall through to regex parsing
-        }
         // Parse from text output
         const hashMatch = output.match(/Wallet hash:\s*(.+)/i);
         const addressMatch = output.match(/Address:\s*(.+)/i);
-        const mnemonicMatch = output.match(/Recovery phrase[\s\S]*?([a-z]+(?:\s+[a-z]+){11,23})/i);
-        if (mnemonicMatch) {
+        // Extract mnemonic from numbered seed phrase list
+        const phraseSection = output.match(/Seed phrase:\s*\n([\s\S]*?)(?=\n\s*Wallet hash)/i);
+        let mnemonic = undefined;
+        if (phraseSection) {
+            const words = [];
+            for (const line of phraseSection[1].trim().split('\n')) {
+                const m = line.match(/^\s*\d+\.\s+(\w+)/);
+                if (m)
+                    words.push(m[1]);
+            }
+            if (words.length >= 12)
+                mnemonic = words.join(' ');
+        }
+        if (mnemonic) {
             console.log('\\n⚠️  IMPORTANT: Your wallet has been created!');
             console.log('\\nSAVE THIS RECOVERY PHRASE SECURELY:');
             console.log('═'.repeat(60));
-            console.log(mnemonicMatch[1]);
+            console.log(mnemonic);
             console.log('═'.repeat(60));
             console.log('\\nWithout this phrase, you CANNOT recover your funds if you');
             console.log('lose access to this device. Write it down and store it safely.\\n');
@@ -236,7 +224,7 @@ async function createWallet() {
             hash: hashMatch ? hashMatch[1].trim() : undefined,
             address: addressMatch ? addressMatch[1].trim() : undefined,
             balance: '0 BCH',
-            mnemonic: mnemonicMatch ? mnemonicMatch[1] : undefined
+            mnemonic
         };
     }
     catch (err) {
