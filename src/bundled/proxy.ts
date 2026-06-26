@@ -75,6 +75,8 @@ function checkHeartbeat() {
 let heartbeatChecker = null;
 
 // Store pending payment requests per wallet hash
+// Each entry: { body, modelId, displayName, durationMinutes, tiers[], step }
+// step: 'tier_select' (user must pick a tier) or 'approval' (yes/no)
 const pendingPayments = new Map();
 
 // Utility: run shell command and return output
@@ -157,8 +159,58 @@ function sseDone(res) {
   res.write('data: [DONE]\\n\\n');
 }
 
+// Build and stream SSE tier selection prompt
+async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'X-Payment-Required': 'true',
+    'Connection': 'keep-alive',
+  });
+
+  sseLine(res, {
+    id: 'tier-1',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: modelName,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  });
+
+  sseLine(res, {
+    id: 'tier-2',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: '💳 Select a plan for ' + (modelName || 'AI Model') + '\\n\\n' }, finish_reason: null }],
+  });
+
+  for (let i = 0; i < tiers.length; i++) {
+    const tier = tiers[i];
+    const label = String(i + 1) + '️⃣ ';
+    sseLine(res, {
+      id: 'tier-3-' + i,
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: label + tier.minutes + ' minutes — ₱' + tier.price_php.toFixed(2) + '\\n' }, finish_reason: null }],
+    });
+  }
+
+  sseLine(res, {
+    id: 'tier-4',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + '), e.g. type ' + tiers[0].minutes + ':' }, finish_reason: 'stop' }],
+  });
+
+  sseLine(res, {
+    id: 'tier-5',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+
+  sseDone(res);
+  res.end();
+}
+
 // Build and stream SSE loading sequence + payment prompt
-async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUsed = 0, tokenLimit = 50000, carryoverDeadline = null) {
+async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUsed = 0, tokenLimit = 50000, timeRemainingSeconds = 0) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -289,7 +341,8 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
   }
   
   if (isRenewal) {
-    const unusedTokens = Math.max(0, tokenLimit - tokensUsed);
+    const usedMinutes = Math.round(timeRemainingSeconds / 60);
+    const remainingAttr = usedMinutes > 0 ? usedMinutes + ' min remaining' : 'depleted';
     sseLine(res, {
       id: baseId + '-11',
       object: 'chat.completion.chunk',
@@ -298,19 +351,8 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     sseLine(res, {
       id: baseId + '-12',
       object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Unused Tokens Carried Over: +' + unusedTokens.toLocaleString() + '\\n' }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: '⏱ Time Credits: ' + remainingAttr + '\\n' }, finish_reason: null }],
     });
-    if (carryoverDeadline) {
-      const minutesLeft = Math.max(0, Math.floor((new Date(carryoverDeadline) - Date.now()) / 60000));
-      const timeStr = minutesLeft > 0
-        ? minutesLeft + ' min' + (minutesLeft !== 1 ? 's' : '') + ' remaining'
-        : 'expired — renew now to keep them';
-      sseLine(res, {
-        id: baseId + '-12b',
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: '⏰ Carryover expires in ' + timeStr + '\\n' }, finish_reason: null }],
-      });
-    }
   }
   
   sseLine(res, {
@@ -474,7 +516,7 @@ function forceNonStreaming(body) {
 // Convert a chat.completion JSON object to SSE format
 function jsonToSse(res, chatCompletion) {
   const content = chatCompletion.choices?.[0]?.message?.content || '';
-  const model = chatCompletion.model || 'deepseek-ai/DeepSeek-V4-Flash';
+  const model = chatCompletion.model || chatCompletion.model_id || 'deepseek-ai/DeepSeek-V4-Flash';
   const created = chatCompletion.created || Math.floor(Date.now() / 1000);
 
 
@@ -540,7 +582,7 @@ function jsonToSse(res, chatCompletion) {
 }
 
 // Run paytaca pay internally and return the response
-function runPaytacaPay(djangoUrl, body, walletHash, callback) {
+function runPaytacaPay(djangoUrl, body, walletHash, extraHeaders, callback) {
   const url = djangoUrl + '/chat/completions?wallet_hash=' + encodeURIComponent(walletHash || '');
   const payBody = forceNonStreaming(body);
 
@@ -558,7 +600,7 @@ function runPaytacaPay(djangoUrl, body, walletHash, callback) {
   const config = {
     url,
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {}),
     bodyFile,
     confirmed: true,
   };
@@ -650,7 +692,7 @@ const server = http.createServer(async (req, res) => {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Wallet-Hash, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Wallet-Hash, X-Model-Id, X-Duration-Minutes, Payment-Signature, Authorization');
   
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
@@ -679,11 +721,22 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       proxy_url: 'http://localhost:' + PROXY_PORT + '/v1',
       django_url: BACKEND_URL + '/v1',
-      cost_sats: 6000,
-      cost_bch: '0.00006',
       payment_address: '',
-      session_duration_minutes: 5,
-      token_limit: 50000,
+      default_model: 'deepseek-ai/DeepSeek-V4-Flash',
+      default_duration_minutes: 30,
+      models: [
+        {
+          id: 'deepseek-ai/DeepSeek-V4-Flash',
+          object: 'model',
+          display_name: 'DeepSeek V4 Flash',
+          provider: 'gmi',
+          price_tiers: [
+            { minutes: 10, price_php: 5.0, price_sats: 45000 },
+            { minutes: 30, price_php: 12.0, price_sats: 108000 },
+            { minutes: 60, price_php: 20.0, price_sats: 180000 },
+          ],
+        },
+      ],
       context_retention_hours: 2,
     }));
     return;
@@ -713,13 +766,108 @@ const server = http.createServer(async (req, res) => {
       
       
       if (pendingPayload) {
-        // User responded to a payment prompt
+        // Check for tier selection first
+        if (pendingPayload.step === 'tier_select' && pendingPayload.tiers && pendingPayload.tiers.length > 0) {
+          const userInput = lastContent.trim();
+          let selectedIndex = -1;
+          
+          // Try to parse user input as a number (1-based)
+          const num = parseInt(userInput, 10);
+          if (!isNaN(num) && num >= 1 && num <= pendingPayload.tiers.length) {
+            selectedIndex = num - 1;
+          } else {
+            // Try to match by duration minutes
+            for (let i = 0; i < pendingPayload.tiers.length; i++) {
+              if (userInput === String(pendingPayload.tiers[i].minutes) ||
+                  userInput === pendingPayload.tiers[i].minutes + ' minutes' ||
+                  userInput === pendingPayload.tiers[i].minutes + ' min') {
+                selectedIndex = i;
+                break;
+              }
+            }
+          }
+          
+          if (selectedIndex >= 0) {
+            const selectedTier = pendingPayload.tiers[selectedIndex];
+            pendingPayload.durationMinutes = selectedTier.minutes;
+            pendingPayload.step = 'processing';
+            
+            log('Tier selected: ' + selectedTier.minutes + ' min for wallet ' + walletHash?.substring(0, 16) + '...');
+            
+            // Build extra headers for payment wrapper
+            const extraHeaders = {};
+            if (pendingPayload.modelId) {
+              extraHeaders['X-Model-Id'] = pendingPayload.modelId;
+            }
+            extraHeaders['X-Duration-Minutes'] = String(selectedTier.minutes);
+            
+            runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
+              pendingPayments.delete(walletHash);
+              
+              if (err) {
+                log('paytaca pay failed: ' + err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                  error: 'Payment failed', 
+                  message: err.message,
+                  details: 'Please check your wallet balance and try again.'
+                }));
+                return;
+              }
+              
+              if (!responseJson.success) {
+                res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                  error: 'Payment failed', 
+                  message: responseJson.error,
+                  details: 'Payment was not successful. Please check your balance and try again.'
+                }));
+                return;
+              }
+              
+              const chatCompletion = responseJson?.data || responseJson;
+              
+              let wasStreaming = false;
+              try {
+                wasStreaming = JSON.parse(pendingPayload.body).stream === true;
+              } catch {}
+              
+              log('paytaca pay succeeded. Returning chat response.');
+              
+              if (wasStreaming) {
+                try {
+                  jsonToSse(res, chatCompletion);
+                } catch (e) {}
+              } else {
+                try {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify(chatCompletion));
+                } catch (e) {}
+              }
+            });
+            return;
+          } else {
+            // Invalid selection — reshow the prompt
+            log('Invalid tier selection for wallet ' + walletHash?.substring(0, 16) + '...');
+            await streamTierSelectionPrompt(res, walletHash, pendingPayload.displayName || pendingPayload.modelId || 'AI Model', pendingPayload.tiers);
+            return;
+          }
+        }
+        
+        // Old flow: user responded to a yes/no payment prompt
         if (lastContent === 'yes') {
-          // User approved — run paytaca pay with the stored original payload
           log('Payment approved by wallet ' + walletHash?.substring(0, 16) + '...');
           pendingPayments.delete(walletHash);
           
-          runPaytacaPay(BACKEND_URL + '/v1', pendingPayload, walletHash, (err, responseJson) => {
+          const extraHeaders = {};
+          if (pendingPayload.modelId) {
+            extraHeaders['X-Model-Id'] = pendingPayload.modelId;
+          }
+          if (pendingPayload.durationMinutes) {
+            extraHeaders['X-Duration-Minutes'] = String(pendingPayload.durationMinutes);
+          }
+          
+          runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
             if (err) {
               log('paytaca pay failed: ' + err.message);
               res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -731,8 +879,6 @@ const server = http.createServer(async (req, res) => {
               return;
             }
             
-            
-            // Check if the response indicates success
             if (!responseJson.success) {
               res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ 
@@ -744,12 +890,10 @@ const server = http.createServer(async (req, res) => {
             }
             
             const chatCompletion = responseJson?.data || responseJson;
-            if (chatCompletion.choices) {
-            }
             
             let wasStreaming = false;
             try {
-              wasStreaming = JSON.parse(pendingPayload).stream === true;
+              wasStreaming = JSON.parse(pendingPayload.body).stream === true;
             } catch {}
             
             log('paytaca pay succeeded. Returning chat response.');
@@ -757,20 +901,17 @@ const server = http.createServer(async (req, res) => {
             if (wasStreaming) {
               try {
                 jsonToSse(res, chatCompletion);
-              } catch (e) {
-              }
+              } catch (e) {}
             } else {
               try {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(chatCompletion));
-              } catch (e) {
-              }
+              } catch (e) {}
             }
           });
           return;
           
         } else if (lastContent === 'no') {
-          // User declined
           log('Payment declined by wallet ' + walletHash?.substring(0, 16) + '...');
           pendingPayments.delete(walletHash);
 
@@ -783,7 +924,7 @@ const server = http.createServer(async (req, res) => {
             id: 'payment-declined',
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
-            model: 'deepseek-ai/DeepSeek-V4-Flash',
+            model: pendingPayload.modelId || 'deepseek-ai/DeepSeek-V4-Flash',
             choices: [{
               index: 0,
               message: {
@@ -817,20 +958,56 @@ const server = http.createServer(async (req, res) => {
 
         if (statusCode === 402) {
           log('402 intercepted for wallet ' + walletHash?.substring(0, 16) + '...');
-          pendingPayments.set(walletHash, body);
+          
+          // Parse 402 response for model_id and price_tiers
+          let modelId = null;
+          let displayName = null;
+          let tiers = null;
+          try {
+            const parsed = JSON.parse(responseBody);
+            modelId = parsed.model_id || null;
+            displayName = parsed.display_name || null;
+            tiers = parsed.price_tiers || null;
+          } catch (e) {
+            log('Could not parse 402 body: ' + e.message);
+          }
+          
+          pendingPayments.set(walletHash, {
+            body: body,
+            modelId: modelId,
+            durationMinutes: null,
+            tiers: tiers,
+            step: tiers ? 'tier_select' : 'approval'
+          });
+          
+          if (tiers && tiers.length > 0) {
+            // New flow: show tier selection prompt
+            await streamTierSelectionPrompt(res, walletHash, displayName || modelId || 'AI Model', tiers);
+            return;
+          }
           
           // Check session status to determine if this is a renewal
           let isRenewal = false;
           let tokensUsed = 0;
           let tokenLimit = 50000;
-          let carryoverDeadline = null;
+          let timeRemainingSeconds = 0;
           
+          let statusModelId = modelId;
           try {
+            // Extract model from the original request body if not in 402
+            if (!statusModelId) {
+              try {
+                const bodyParsed = JSON.parse(body);
+                statusModelId = bodyParsed.model || null;
+              } catch (e) {}
+            }
+            
+            const statusPath = '/v1/wallet/status' + (statusModelId ? '?model_id=' + encodeURIComponent(statusModelId) : '');
             const statusResponse = await new Promise((resolve, reject) => {
               const statusReq = REQUester.get({
                 hostname: DJANGO_HOST,
                 port: DJANGO_PORT,
-                path: '/v1/wallet/status',
+                path: statusPath,
                 headers: { 'X-Wallet-Hash': walletHash }
               }, (res) => {
                 let data = '';
@@ -850,20 +1027,17 @@ const server = http.createServer(async (req, res) => {
             if (statusResponse) {
               tokensUsed = statusResponse.tokens_used || 0;
               tokenLimit = statusResponse.token_limit || 50000;
-              carryoverDeadline = statusResponse.carryover_deadline || null;
+              timeRemainingSeconds = statusResponse.time_remaining_seconds || 0;
               
-              const hasExpiredSession = !statusResponse.session_active && tokensUsed > 0;
-              const carryoverStillValid = (statusResponse.carryover_remaining_minutes || 0) > 0;
-              
-              // Renewal if: (1) session active but tokens exhausted, OR (2) session expired with valid carryover
-              isRenewal = (statusResponse.session_active && tokensUsed >= tokenLimit) ||
-                         (hasExpiredSession && carryoverStillValid);
+              // Renewal if session has been used (tokens > 0 or time > 0) but is now exhausted
+              isRenewal = (tokensUsed > 0 || statusResponse.time_used_seconds > 0) &&
+                          (!statusResponse.session_active || timeRemainingSeconds <= 0);
             }
           } catch (err) {
             log('Failed to check session status: ' + err.message);
           }
           
-          await streamPaymentPrompt(res, walletHash, isRenewal, tokensUsed, tokenLimit, carryoverDeadline);
+          await streamPaymentPrompt(res, walletHash, isRenewal, tokensUsed, tokenLimit, timeRemainingSeconds);
         } else {
           if (res.headersSent) {
             log('Streaming response completed and already sent');

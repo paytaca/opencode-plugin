@@ -32,21 +32,46 @@ async function OpencodePlugin(_input, _options) {
     return {
         config: async (cfg) => {
             cfg.provider = cfg.provider || {};
+            // Fetch available models from proxy config endpoint
+            let models = {};
+            try {
+                const response = await fetch(`http://localhost:${proxy.port}/v1/config`);
+                if (response.ok) {
+                    const backendConfig = await response.json();
+                    const configData = backendConfig;
+                    if (configData.models && Array.isArray(configData.models)) {
+                        for (const model of configData.models) {
+                            models[model.id] = {
+                                name: model.display_name || model.id,
+                                limit: {
+                                    context: 128000,
+                                    output: 8192,
+                                },
+                            };
+                        }
+                    }
+                }
+            }
+            catch (err) {
+                console.error('Failed to fetch models from proxy:', err);
+            }
+            // Fallback if no models fetched
+            if (Object.keys(models).length === 0) {
+                models['deepseek-ai/DeepSeek-V4-Flash'] = {
+                    name: 'DeepSeek V4 Flash',
+                    limit: {
+                        context: 128000,
+                        output: 8192,
+                    },
+                };
+            }
             cfg.provider['paytaca-ai'] = {
                 npm: '@ai-sdk/openai-compatible',
                 name: 'Paytaca AI',
                 options: {
-                    baseURL: `http://localhost:${proxy.port}/v1`
+                    baseURL: `http://localhost:${proxy.port}/v1`,
                 },
-                models: {
-                    'deepseek-ai/DeepSeek-V4-Flash': {
-                        name: 'DeepSeek V4 Flash',
-                        limit: {
-                            context: 128000,
-                            output: 8192
-                        }
-                    }
-                }
+                models,
             };
         },
         "chat.headers": async (_input, output) => {
@@ -55,9 +80,9 @@ async function OpencodePlugin(_input, _options) {
                 wallet = await (0, wallet_1.ensureWallet)();
             }
             output.headers = {
-                'X-Wallet-Hash': wallet.hash || ''
+                'X-Wallet-Hash': wallet.hash || '',
             };
-        }
+        },
     };
 }
 module.exports = { id: '@paytaca/opencode-plugin', server: OpencodePlugin };

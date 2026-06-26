@@ -38,21 +38,48 @@ async function OpencodePlugin(_input?: any, _options?: any) {
   return {
     config: async (cfg: any) => {
       cfg.provider = cfg.provider || {};
+
+      // Fetch available models from proxy config endpoint
+      let models: Record<string, any> = {};
+      try {
+        const response = await fetch(`http://localhost:${proxy.port}/v1/config`);
+        if (response.ok) {
+          const backendConfig = await response.json();
+          const configData = backendConfig as any;
+          if (configData.models && Array.isArray(configData.models)) {
+            for (const model of configData.models) {
+              models[model.id] = {
+                name: model.display_name || model.id,
+                limit: {
+                  context: 128000,
+                  output: 8192,
+                },
+              };
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to fetch models from proxy:', err);
+      }
+
+      // Fallback if no models fetched
+      if (Object.keys(models).length === 0) {
+        models['deepseek-ai/DeepSeek-V4-Flash'] = {
+          name: 'DeepSeek V4 Flash',
+          limit: {
+            context: 128000,
+            output: 8192,
+          },
+        };
+      }
+
       cfg.provider['paytaca-ai'] = {
         npm: '@ai-sdk/openai-compatible',
         name: 'Paytaca AI',
         options: {
-          baseURL: `http://localhost:${proxy.port}/v1`
+          baseURL: `http://localhost:${proxy.port}/v1`,
         },
-        models: {
-          'deepseek-ai/DeepSeek-V4-Flash': {
-            name: 'DeepSeek V4 Flash',
-            limit: {
-              context: 128000,
-              output: 8192
-            }
-          }
-        }
+        models,
       };
     },
     "chat.headers": async (_input: any, output: any) => {
@@ -61,9 +88,9 @@ async function OpencodePlugin(_input?: any, _options?: any) {
         wallet = await ensureWallet();
       }
       output.headers = {
-        'X-Wallet-Hash': wallet.hash || ''
+        'X-Wallet-Hash': wallet.hash || '',
       };
-    }
+    },
   };
 }
 
