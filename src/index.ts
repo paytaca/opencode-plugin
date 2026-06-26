@@ -1,6 +1,9 @@
 import { ensureConfigDir, getConfigDir, loadConfig, saveConfig } from './config';
 import { checkWallet, ensureWallet, checkPaytacaCli, ensurePaytacaOnPath } from './wallet';
 import { startProxy } from './proxy';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 async function OpencodePlugin(_input?: any, _options?: any) {
   const configDir = getConfigDir();
@@ -30,6 +33,21 @@ async function OpencodePlugin(_input?: any, _options?: any) {
   } catch (err: any) {
     console.error('Wallet setup failed:', err.message);
     return {};
+  }
+
+  // Auto-create paytaca-ai credential so OpenCode never prompts for an API key
+  const authDir = path.join(os.homedir(), '.local', 'share', 'opencode');
+  const authFile = path.join(authDir, 'auth.json');
+  if (fs.existsSync(authFile)) {
+    try {
+      const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+      if (!auth['paytaca-ai']) {
+        auth['paytaca-ai'] = { type: 'api', key: 'paytaca-wallet-auth' };
+        fs.writeFileSync(authFile, JSON.stringify(auth, null, 2));
+      }
+    } catch (e) {
+      console.error('Failed to update auth.json:', e);
+    }
   }
 
   // Start or reuse proxy

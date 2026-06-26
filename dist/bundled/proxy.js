@@ -151,6 +151,17 @@ async function checkWallet() {
   }
 }
 
+// Format seconds as MM:SS or HH:MM:SS
+function formatDuration(totalSeconds) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  if (hours > 0) {
+    return hours + ':' + String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+  }
+  return minutes + ':' + String(secs).padStart(2, '0');
+}
+
 // SSE helper: write a data line
 function sseLine(res, data) {
   res.write('data: ' + JSON.stringify(data) + '\\n\\n');
@@ -178,30 +189,88 @@ async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
   });
 
+  // Loading sequence
   sseLine(res, {
     id: 'tier-2',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: '⏳ Initializing Paytaca AI provider...\\n' }, finish_reason: null }],
+  });
+
+  const hasCli = await checkPaytacaCli();
+  sseLine(res, {
+    id: 'tier-3',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: 'Checking Paytaca CLI... ' }, finish_reason: null }],
+  });
+  sseLine(res, {
+    id: 'tier-4',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: hasCli ? '✅\\n' : '❌ Not found\\n' }, finish_reason: null }],
+  });
+
+  const hasWallet = hasCli ? await checkWallet() : false;
+  sseLine(res, {
+    id: 'tier-5',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: 'Checking wallet... ' }, finish_reason: null }],
+  });
+  sseLine(res, {
+    id: 'tier-6',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: hasWallet ? '✅\\n' : '❌ Not found\\n' }, finish_reason: null }],
+  });
+
+  const balanceSats = hasWallet ? await getWalletBalance() : null;
+  sseLine(res, {
+    id: 'tier-7',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: 'Fetching balance... ' }, finish_reason: null }],
+  });
+
+  let balanceStr;
+  if (balanceSats !== null) {
+    const bch = (balanceSats / 100000000).toFixed(8);
+    balanceStr = bch + ' BCH';
+    sseLine(res, {
+      id: 'tier-8',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: '✅ — ' + balanceStr + '\\n\\n' }, finish_reason: null }],
+    });
+  } else {
+    balanceStr = 'Unable to check';
+    sseLine(res, {
+      id: 'tier-8',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: '\\n' + balanceStr + '\\n\\n' }, finish_reason: null }],
+    });
+  }
+
+  // Tier selection
+  sseLine(res, {
+    id: 'tier-9',
     object: 'chat.completion.chunk',
     choices: [{ index: 0, delta: { content: '💳 Select a plan for ' + (modelName || 'AI Model') + '\\n\\n' }, finish_reason: null }],
   });
 
   for (let i = 0; i < tiers.length; i++) {
     const tier = tiers[i];
-    const label = String(i + 1) + '️⃣ ';
+    const bchAmount = (tier.price_sats / 100000000).toFixed(8);
+    const label = String(i + 1) + '️⃣   ';
     sseLine(res, {
-      id: 'tier-3-' + i,
+      id: 'tier-10-' + i,
       object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: label + tier.minutes + ' minutes — ₱' + tier.price_php.toFixed(2) + '\\n' }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: label + tier.minutes + ' minutes — ₱' + tier.price_php.toFixed(2) + ' (' + bchAmount + ' BCH)\\n' }, finish_reason: null }],
     });
   }
 
   sseLine(res, {
-    id: 'tier-4',
+    id: 'tier-11',
     object: 'chat.completion.chunk',
     choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + '), e.g. type ' + tiers[0].minutes + ':' }, finish_reason: 'stop' }],
   });
 
   sseLine(res, {
-    id: 'tier-5',
+    id: 'tier-12',
     object: 'chat.completion.chunk',
     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
@@ -803,6 +872,29 @@ const server = http.createServer(async (req, res) => {
             }
             extraHeaders['X-Duration-Minutes'] = String(selectedTier.minutes);
             
+            // Check wallet balance before attempting payment
+            const currentBalanceSats = await getWalletBalance();
+            if (currentBalanceSats !== null && selectedTier.price_sats && currentBalanceSats < selectedTier.price_sats) {
+              log('Insufficient balance for wallet ' + walletHash?.substring(0, 16) + '...: ' + currentBalanceSats + ' sats < ' + selectedTier.price_sats + ' sats needed');
+              pendingPayments.delete(walletHash);
+              const addr = await getReceivingAddress();
+              const neededBch = (selectedTier.price_sats - currentBalanceSats) / 100000000;
+              const neededLine = addr ? '\\n\\n📥 **Fund your wallet:** \\\`' + addr + '\\\`\\nOr run: paytaca receive (in another terminal) for QR code' : '';
+              sseLine(res, {
+                id: 'balance-err',
+                object: 'chat.completion.chunk',
+                choices: [{ index: 0, delta: { content: '\\n\\n❌ **Insufficient balance** — You have **' + (currentBalanceSats / 100000000).toFixed(8) + ' BCH** but need **' + (selectedTier.price_sats / 100000000).toFixed(8) + ' BCH** for this plan. Top up at least **' + neededBch.toFixed(8) + ' BCH** more.' + neededLine + '\\n\\nType \\\`balance\\\` to re-check or try a different plan:' }, finish_reason: 'stop' }],
+              });
+              sseLine(res, {
+                id: 'balance-err-done',
+                object: 'chat.completion.chunk',
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+              });
+              sseDone(res);
+              res.end();
+              return;
+            }
+            
             runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
               pendingPayments.delete(walletHash);
               
@@ -943,6 +1035,56 @@ const server = http.createServer(async (req, res) => {
         } else {
           log('New message while payment pending for wallet ' + walletHash?.substring(0, 16) + '...');
         }
+      }
+      
+      // Handle time/credits command — show remaining time credits
+      const cmd = lastContent?.trim().toLowerCase();
+      if (cmd === 'time' || cmd === 'credits') {
+        log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
+        const statusUrl = BACKEND_URL + '/v1/wallet/status';
+        const statusRes = await fetch(statusUrl, {
+          headers: { 'X-Wallet-Hash': walletHash }
+        });
+        let content;
+        if (statusRes.ok) {
+          const statusData = await statusRes.json();
+          const sessions = statusData.sessions || [];
+          if (sessions.length === 0) {
+            content = '⏱️  No active time credits.';
+          } else {
+            const lines = sessions.map(s => {
+              const total = formatDuration(s.time_credits_seconds);
+              const remaining = formatDuration(s.time_remaining_seconds);
+              const used = formatDuration(s.time_used_seconds);
+              return '  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' purchased (' + used + ' used)';
+            });
+            content = '⏱️  **Active Time Credits:**\\n' + lines.join('\\n');
+          }
+        } else {
+          content = '⏱️  Unable to check time credits.';
+        }
+        
+        sseLine(res, {
+          id: 'time-1',
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: 'deepseek-ai/DeepSeek-V4-Flash',
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+        });
+        sseLine(res, {
+          id: 'time-2',
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
+        });
+        sseLine(res, {
+          id: 'time-3',
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+        sseDone(res);
+        res.end();
+        return;
       }
       
       let isStreaming = true;
