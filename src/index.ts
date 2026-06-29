@@ -42,7 +42,7 @@ async function OpencodePlugin(_input?: any, _options?: any) {
     try {
       const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
       if (!auth['paytaca-ai']) {
-        auth['paytaca-ai'] = { type: 'api', key: 'paytaca-wallet-auth' };
+        auth['paytaca-ai'] = { type: 'api', key: 'sk-paytaca-wallet-auth' };
         fs.writeFileSync(authFile, JSON.stringify(auth, null, 2));
       }
     } catch (e) {
