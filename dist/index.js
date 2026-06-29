@@ -51,11 +51,13 @@ async function OpencodePlugin(_input, _options) {
         return {};
     }
     // Ensure wallet exists (auto-create if needed)
+    let cachedWalletHash = '';
     try {
         const wallet = await (0, wallet_1.ensureWallet)();
         // Save wallet hash to config
         if (wallet.hash) {
             config.walletHash = wallet.hash;
+            cachedWalletHash = wallet.hash;
             (0, config_1.saveConfig)(configDir, config);
         }
     }
@@ -64,8 +66,20 @@ async function OpencodePlugin(_input, _options) {
         return {};
     }
     // Auto-create paytaca-ai credential so OpenCode never prompts for an API key
-    const authDir = path.join(os.homedir(), '.local', 'share', 'opencode');
-    const authFile = path.join(authDir, 'auth.json');
+    const authCandidates = [
+        path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
+        path.join(os.homedir(), 'Library', 'Application Support', 'opencode', 'auth.json'),
+    ];
+    if (process.env.APPDATA) {
+        authCandidates.push(path.join(process.env.APPDATA, 'opencode', 'auth.json'));
+    }
+    let authFile = authCandidates[0];
+    for (const f of authCandidates) {
+        if (fs.existsSync(f)) {
+            authFile = f;
+            break;
+        }
+    }
     if (fs.existsSync(authFile)) {
         try {
             const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
@@ -126,12 +140,8 @@ async function OpencodePlugin(_input, _options) {
             };
         },
         "chat.headers": async (_input, output) => {
-            let wallet = await (0, wallet_1.checkWallet)();
-            if (!wallet.exists) {
-                wallet = await (0, wallet_1.ensureWallet)();
-            }
             output.headers = {
-                'X-Wallet-Hash': wallet.hash || '',
+                'X-Wallet-Hash': cachedWalletHash || '',
             };
         },
     };
