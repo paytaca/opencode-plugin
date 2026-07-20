@@ -45,7 +45,7 @@ function log(message) {
 
 // Heartbeat monitoring - proxy exits if heartbeat is stale
 const HEARTBEAT_FILE = path.join(LOG_DIR, 'heartbeat');
-const HEARTBEAT_TIMEOUT = 15000; // 15 seconds
+const HEARTBEAT_TIMEOUT = 300000; // 5 minutes
 
 function checkHeartbeat() {
   try {
@@ -1037,7 +1037,7 @@ const server = http.createServer(async (req, res) => {
       
       // Handle time/credits command — show remaining time credits
       const cmd = lastContent?.trim().toLowerCase();
-      if (cmd === 'time' || cmd === 'credits') {
+      if (cmd === 'time' || cmd === 'credit' || cmd === 'credits') {
         log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
         const statusUrl = BACKEND_URL + '/v1/wallet/status';
         const statusRes = await fetch(statusUrl, {

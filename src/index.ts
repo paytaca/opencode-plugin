@@ -67,6 +67,36 @@ async function OpencodePlugin(_input?: any, _options?: any) {
   // Start or reuse proxy
   const proxy = await startProxy(configDir, config);
 
+  // Auto-install paytaca-wallet skill globally (copy from paytaca-cli dependency)
+  try {
+    const skillCandidates: string[] = [
+      path.join(os.homedir(), '.config', 'opencode', 'skills'),
+      path.join(os.homedir(), 'Library', 'Application Support', 'opencode', 'skills'),
+    ];
+    if (process.env.APPDATA) {
+      skillCandidates.push(path.join(process.env.APPDATA, 'opencode', 'skills'));
+    }
+    let globalSkillsDir = skillCandidates[0];
+    for (const d of skillCandidates) {
+      if (fs.existsSync(d) || d === skillCandidates[0]) {
+        globalSkillsDir = d;
+        break;
+      }
+    }
+    const walletSkillDir = path.join(globalSkillsDir, 'paytaca-wallet');
+    if (!fs.existsSync(walletSkillDir)) {
+      const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
+      const srcSkillDir = path.resolve(path.dirname(paytacaCliPkg), 'skills', 'paytaca-wallet');
+      const srcSkillFile = path.join(srcSkillDir, 'SKILL.md');
+      if (fs.existsSync(srcSkillFile)) {
+        fs.mkdirSync(walletSkillDir, { recursive: true });
+        fs.copyFileSync(srcSkillFile, path.join(walletSkillDir, 'SKILL.md'));
+      }
+    }
+  } catch (e: any) {
+    console.error('Failed to install paytaca-wallet skill:', e.message);
+  }
+
   return {
     config: async (cfg: any) => {
       cfg.provider = cfg.provider || {};
