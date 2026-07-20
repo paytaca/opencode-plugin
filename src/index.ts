@@ -126,7 +126,7 @@ async function OpencodePlugin(_input?: any, _options?: any) {
 
       // Fallback if no models fetched
       if (Object.keys(models).length === 0) {
-        models['deepseek-ai/DeepSeek-V4-Flash'] = {
+        models['deepseek/deepseek-v4-flash'] = {
           name: 'DeepSeek V4 Flash',
           limit: {
             context: 128000,

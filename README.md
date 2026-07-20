@@ -33,7 +33,7 @@ Once installed and configured in your OpenCode settings, the plugin automaticall
 
 - Creates a wallet on first run (recovery phrase is printed — save it securely)
 - Starts a local proxy that manages x402 payment flows transparently
-- Provides the `paytaca-ai` provider with the `deepseek-ai/DeepSeek-V4-Flash` model
+- Provides the `paytaca-ai` provider with the `deepseek/deepseek-v4-flash` model
 
 ### Wallet management
 
@@ -81,7 +81,7 @@ Override via `PAYTACA_BACKEND_URL` environment variable (highest priority).
                               └─────────────────┘
 ```
 
-The proxy runs as a detached Node.js process with heartbeat monitoring. It auto-exits after 15 seconds without a heartbeat (when all editor windows close).
+The proxy runs as a detached Node.js process with heartbeat monitoring. It auto-exits after 5 minutes without a heartbeat (when all editor windows close).
 
 ## License
 

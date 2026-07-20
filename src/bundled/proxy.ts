@@ -312,7 +312,7 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     id: baseId + '-1',
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
-    model: 'deepseek-ai/DeepSeek-V4-Flash',
+    model: 'deepseek/deepseek-v4-flash',
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
   });
 
@@ -585,7 +585,7 @@ function forceNonStreaming(body) {
 // Convert a chat.completion JSON object to SSE format
 function jsonToSse(res, chatCompletion) {
   const content = chatCompletion.choices?.[0]?.message?.content || '';
-  const model = chatCompletion.model || chatCompletion.model_id || 'deepseek-ai/DeepSeek-V4-Flash';
+  const model = chatCompletion.model || chatCompletion.model_id || 'deepseek/deepseek-v4-flash';
   const created = chatCompletion.created || Math.floor(Date.now() / 1000);
 
 
@@ -791,14 +791,14 @@ const server = http.createServer(async (req, res) => {
       proxy_url: 'http://localhost:' + PROXY_PORT + '/v1',
       django_url: BACKEND_URL + '/v1',
       payment_address: '',
-      default_model: 'deepseek-ai/DeepSeek-V4-Flash',
+      default_model: 'deepseek/deepseek-v4-flash',
       default_duration_minutes: 30,
       models: [
         {
-          id: 'deepseek-ai/DeepSeek-V4-Flash',
+          id: 'deepseek/deepseek-v4-flash',
           object: 'model',
           display_name: 'DeepSeek V4 Flash',
-          provider: 'gmi',
+          provider: 'openrouter',
           price_tiers: [
             { minutes: 10, price_php: 5.0, price_sats: 45000 },
             { minutes: 30, price_php: 12.0, price_sats: 108000 },
@@ -1016,7 +1016,7 @@ const server = http.createServer(async (req, res) => {
             id: 'payment-declined',
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
-            model: pendingPayload.modelId || 'deepseek-ai/DeepSeek-V4-Flash',
+            model: pendingPayload.modelId || 'deepseek/deepseek-v4-flash',
             choices: [{
               index: 0,
               message: {
@@ -1047,17 +1047,26 @@ const server = http.createServer(async (req, res) => {
         if (statusRes.ok) {
           const statusData = await statusRes.json();
           const sessions = statusData.sessions || [];
-          if (sessions.length === 0) {
-            content = '⏱️  No active time credits.';
-          } else {
-            const lines = sessions.map(s => {
+          const activeSessions = sessions.filter(s => s.time_remaining_seconds > 0 && s.model_active);
+          const inactiveSessions = sessions.filter(s => s.time_remaining_seconds > 0 && !s.model_active);
+          const parts = [];
+          if (activeSessions.length > 0) {
+            parts.push('**⏱️  Active Time Credits:**');
+            activeSessions.forEach(s => {
               const total = formatDuration(s.time_credits_seconds);
               const remaining = formatDuration(s.time_remaining_seconds);
               const used = formatDuration(s.time_used_seconds);
-              return '  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' purchased (' + used + ' used)';
+              parts.push('  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' (' + used + ' used)');
             });
-            content = '⏱️  **Active Time Credits:**\\n' + lines.join('\\n');
           }
+          if (inactiveSessions.length > 0) {
+            parts.push('\\n**⚠️  Inactive Model:**');
+            inactiveSessions.forEach(s => {
+              const remaining = formatDuration(s.time_remaining_seconds);
+              parts.push('  - **' + (s.display_name || s.ai_model) + ' (Inactive)** — ' + remaining + ' remaining');
+            });
+          }
+          content = parts.length > 0 ? parts.join('\\n') : '⏱️  No active time credits.';
         } else {
           content = '⏱️  Unable to check time credits.';
         }
@@ -1066,7 +1075,7 @@ const server = http.createServer(async (req, res) => {
           id: 'time-1',
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
-          model: 'deepseek-ai/DeepSeek-V4-Flash',
+          model: 'deepseek/deepseek-v4-flash',
           choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
         });
         sseLine(res, {
