@@ -546,6 +546,25 @@ function forwardStreaming(req, res, body, callback) {
       'Connection': 'keep-alive',
     });
 
+    // Keepalive until first chunk of actual response
+    let gotFirstChunk = false;
+    const keepalive = setInterval(() => {
+      if (!gotFirstChunk) {
+        sseLine(res, {
+          id: 'ka-' + Date.now(),
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
+        });
+      }
+    }, 2000);
+
+    djangoRes.on('data', () => {
+      if (!gotFirstChunk) {
+        gotFirstChunk = true;
+        clearInterval(keepalive);
+      }
+    });
+
     djangoRes.pipe(res);
     
     res.on('close', () => {
@@ -588,15 +607,16 @@ function jsonToSse(res, chatCompletion) {
   const model = chatCompletion.model || chatCompletion.model_id || 'deepseek/deepseek-v4-flash';
   const created = chatCompletion.created || Math.floor(Date.now() / 1000);
 
-
-  try {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-  } catch (e) {
-    return;
+  if (!res.headersSent) {
+    try {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+    } catch (e) {
+      return;
+    }
   }
 
   try {
@@ -819,9 +839,9 @@ const server = http.createServer(async (req, res) => {
       const walletHash = req.headers['x-wallet-hash'];
       const lastContent = getLastUserMessageContent(body);
       
-      // DEBUG: Log full body and parsed content
-      
       log('Request received: wallet=' + (walletHash?.substring(0, 16) || 'none') + '..., bodyLen=' + body.length + ', pending=' + pendingPayments.has(walletHash));
+      
+      const stripSysRem = (s: string) => { let r = (s || ''), a = '<system-reminder>', b = '</system-reminder>', i = r.indexOf(a); while (i !== -1) { let j = r.indexOf(b, i); if (j === -1) break; r = r.substring(0, i) + r.substring(j + b.length); i = r.indexOf(a); } return r.trim(); };
       
       // Guard: wallet hash is required for payment flow
       if (!walletHash) {
@@ -837,7 +857,7 @@ const server = http.createServer(async (req, res) => {
       if (pendingPayload) {
         // Check for tier selection first
         if (pendingPayload.step === 'tier_select' && pendingPayload.tiers && pendingPayload.tiers.length > 0) {
-          const userInput = lastContent.trim();
+          const userInput = stripSysRem(lastContent);
           let selectedIndex = -1;
           
           // Try to parse user input as a number (1-based)
@@ -893,27 +913,61 @@ const server = http.createServer(async (req, res) => {
               return;
             }
             
+            // Keepalive during payment processing
+            if (!res.headersSent) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Payment-Processing': 'true',
+              });
+            }
+            const keepalive = setInterval(() => {
+              if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
+              sseLine(res, {
+                id: 'ka-' + Date.now(),
+                object: 'chat.completion.chunk',
+                choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
+              });
+            }, 2000);
+
             runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
               pendingPayments.delete(walletHash);
-              
+              clearInterval(keepalive);
+
               if (err) {
                 log('paytaca pay failed: ' + err.message);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                  error: 'Payment failed', 
-                  message: err.message,
-                  details: 'Please check your wallet balance and try again.'
-                }));
+                if (res.headersSent) {
+                  try {
+                    sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
+                    sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                    sseDone(res);
+                    res.end();
+                  } catch (e) {}
+                } else {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+                }
                 return;
               }
               
               if (!responseJson.success) {
-                res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                  error: 'Payment failed', 
-                  message: responseJson.error,
-                  details: 'Payment was not successful. Please check your balance and try again.'
-                }));
+                const isTimeout = responseJson.timeout;
+                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'time\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+                const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
+                const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
+                const errDetails = isTimeout ? 'Try again or check credits with \\'time\\'.' : 'Please check your balance and try again.';
+                if (res.headersSent) {
+                  try {
+                    sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                    sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                    sseDone(res);
+                    res.end();
+                  } catch (e) {}
+                } else {
+                  res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+                }
                 return;
               }
               
@@ -947,7 +1001,7 @@ const server = http.createServer(async (req, res) => {
         }
         
         // Old flow: user responded to a yes/no payment prompt
-        if (lastContent === 'yes') {
+        if (stripSysRem(lastContent) === 'yes') {
           log('Payment approved by wallet ' + walletHash?.substring(0, 16) + '...');
           pendingPayments.delete(walletHash);
           
@@ -959,25 +1013,58 @@ const server = http.createServer(async (req, res) => {
             extraHeaders['X-Duration-Minutes'] = String(pendingPayload.durationMinutes);
           }
           
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'X-Payment-Processing': 'true',
+            });
+          }
+          const keepalive = setInterval(() => {
+            if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
+            sseLine(res, {
+              id: 'ka-' + Date.now(),
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
+            });
+          }, 2000);
+
           runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
+            clearInterval(keepalive);
             if (err) {
               log('paytaca pay failed: ' + err.message);
-              res.writeHead(500, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ 
-                error: 'Payment failed', 
-                message: err.message,
-                details: 'Please check your wallet balance and try again.'
-              }));
+              if (res.headersSent) {
+                try {
+                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
+                  sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                  sseDone(res);
+                  res.end();
+                } catch (e) {}
+              } else {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+              }
               return;
             }
             
             if (!responseJson.success) {
-              res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ 
-                error: 'Payment failed', 
-                message: responseJson.error,
-                details: 'Payment was not successful. Please check your balance and try again.'
-              }));
+              const isTimeout = responseJson.timeout;
+              const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'time\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+              const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
+              const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
+              const errDetails = isTimeout ? 'Try again or check credits with \\'time\\'.' : 'Please check your balance and try again.';
+              if (res.headersSent) {
+                try {
+                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                  sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                  sseDone(res);
+                  res.end();
+                } catch (e) {}
+              } else {
+                res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+              }
               return;
             }
             
@@ -1003,7 +1090,7 @@ const server = http.createServer(async (req, res) => {
           });
           return;
           
-        } else if (lastContent === 'no') {
+        } else if (stripSysRem(lastContent) === 'no') {
           log('Payment declined by wallet ' + walletHash?.substring(0, 16) + '...');
           pendingPayments.delete(walletHash);
 
@@ -1036,7 +1123,7 @@ const server = http.createServer(async (req, res) => {
       }
       
       // Handle time/credits command — show remaining time credits
-      const cmd = lastContent?.trim().toLowerCase();
+      const cmd = stripSysRem(lastContent?.trim().toLowerCase());
       if (cmd === 'time' || cmd === 'credit' || cmd === 'credits') {
         log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
         const statusUrl = BACKEND_URL + '/v1/wallet/status';
