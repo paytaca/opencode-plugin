@@ -109,6 +109,7 @@ async function executePay(url, method, headers, body, bchWallet, x402Payer, isCh
     method,
     headers,
     body: ['POST', 'PUT', 'PATCH'].includes(method) ? body : undefined,
+    signal: AbortSignal.timeout(120000),
   });
 
   const responseHeaders = {};
@@ -152,11 +153,20 @@ async function executePay(url, method, headers, body, bchWallet, x402Payer, isCh
     const paymentPayload = await x402Payer.createPaymentPayload(requirements, paymentRequired.resource.url, txid, 0, requirements.amount);
     headers['PAYMENT-SIGNATURE'] = JSON.stringify(paymentPayload);
 
-    const retryResponse = await fetch(url, {
-      method,
-      headers,
-      body: ['POST', 'PUT', 'PATCH'].includes(method) ? body : undefined,
-    });
+    let retryResponse;
+    try {
+      retryResponse = await fetch(url, {
+        method,
+        headers,
+        body: ['POST', 'PUT', 'PATCH'].includes(method) ? body : undefined,
+        signal: AbortSignal.timeout(120000),
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        return { success: false, timeout: true, error: 'Response timed out from server.' };
+      }
+      throw e;
+    }
     const retryResponseHeaders = {};
     retryResponse.headers.forEach((value, key) => { retryResponseHeaders[key] = value; });
     const retryResponseText = await retryResponse.text();
