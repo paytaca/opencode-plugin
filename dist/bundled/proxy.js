@@ -571,10 +571,10 @@ function forwardStreaming(req, res, body, callback) {
     }
 
     // Buffer SSE data at event boundaries and inject keepalive between events.
-    // Uses sseLine() for keepalive (valid JSON data events, not :ok comments).
     let sseBuffer = '';
     let lastActivity = Date.now();
     let streamingDone = false;
+    let doneForwarded = false;
 
     // Watchdog: inject keepalive only when buffer is empty (between complete events)
     const keepaliveTimer = setInterval(() => {
@@ -585,11 +585,7 @@ function forwardStreaming(req, res, body, callback) {
       const now = Date.now();
       if (now - lastActivity >= 2000 && sseBuffer.length === 0) {
         try {
-          sseLine(res, {
-            id: 'ka-' + Date.now(),
-            object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
-          });
+          res.write(': keepalive\\n\\n');
           lastActivity = now;
         } catch (err) {
           log('Keepalive write error: ' + err.message);
@@ -631,6 +627,7 @@ function forwardStreaming(req, res, body, callback) {
         const cleanEvent = lines.join('\\n') + '\\n\\n';
         extractedCount++;
         var dataContent = lines.map(function(l) { return l.replace(/^data: ?/, ''); }).join('');
+        if (dataContent === '[DONE]') { doneForwarded = true; }
         var lastChar = dataContent.slice(-1);
         if (dataContent !== '[DONE]' && lastChar !== '}' && lastChar !== ']') {
           log('FLUSH: truncated event #' + extractedCount + ' (len=' + dataContent.length + ', end=' + JSON.stringify(dataContent.slice(-30)) + ')');
@@ -658,9 +655,13 @@ function forwardStreaming(req, res, body, callback) {
         log('END: writing remaining buffer len=' + sseBuffer.length + ' start=' + JSON.stringify(sseBuffer.substring(0, 80)));
         try { res.write(sseBuffer); } catch (e) {}
       }
+      if (!doneForwarded) {
+        log('Injecting [DONE] — upstream closed without sending it');
+        try { res.write('data: [DONE]\\n\\n'); } catch (e) {}
+      }
       cleanup();
       try { res.end(); } catch (e) {}
-      log('Streaming response completed');
+      log('Streaming response completed' + (doneForwarded ? '' : ' (injected [DONE])'));
       callback(null, djangoRes.statusCode, {}, '');
     });
 
@@ -1105,11 +1106,7 @@ const server = http.createServer(async (req, res) => {
             }
             const keepalive = setInterval(() => {
               if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
-              sseLine(res, {
-                id: 'ka-' + Date.now(),
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
-              });
+              res.write(': keepalive\\n\\n');
             }, 2000);
 
             runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
@@ -1204,11 +1201,7 @@ const server = http.createServer(async (req, res) => {
           }
           const keepalive = setInterval(() => {
             if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
-            sseLine(res, {
-              id: 'ka-' + Date.now(),
-              object: 'chat.completion.chunk',
-              choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
-            });
+            res.write(': keepalive\\n\\n');
           }, 2000);
 
           runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
