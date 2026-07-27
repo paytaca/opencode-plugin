@@ -152,6 +152,9 @@ async function startProxy(configDir, config) {
     const wrapperScript = (0, config_1.getWrapperScript)(configDir);
     // Ensure config directory exists
     (0, config_1.ensureConfigDir)(configDir);
+    // Always rewrite proxy script so code changes take effect on next restart
+    fs.writeFileSync(proxyScript, proxy_1.PROXY_SCRIPT_CONTENT, 'utf8');
+    fs.chmodSync(proxyScript, '755');
     // Check if proxy already running
     const existingStatus = await getProxyStatus(configDir);
     if (existingStatus.running && existingStatus.pid && existingStatus.port) {
@@ -175,9 +178,6 @@ async function startProxy(configDir, config) {
     }
     // Find available port
     const port = await findAvailablePort(8001, 8010);
-    // Write bundled proxy script to config directory
-    fs.writeFileSync(proxyScript, proxy_1.PROXY_SCRIPT_CONTENT, 'utf8');
-    fs.chmodSync(proxyScript, '755');
     // Write bundled wrapper script to config directory
     fs.writeFileSync(wrapperScript, wrapper_1.WRAPPER_SCRIPT_CONTENT, 'utf8');
     fs.chmodSync(wrapperScript, '755');

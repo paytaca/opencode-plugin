@@ -64,17 +64,6 @@ async function OpencodePlugin(_input?: any, _options?: any) {
     }
   }
 
-  // Auto-sync dist to OpenCode cache so future sessions load latest plugin
-  try {
-    const cacheDist = path.join(os.homedir(), '.cache/opencode/packages/@paytaca/opencode-plugin@latest/node_modules/@paytaca/opencode-plugin/dist');
-    const myDist = path.join(__dirname, '..', 'dist');
-    if (fs.existsSync(cacheDist) && fs.existsSync(myDist)) {
-      fs.cpSync(myDist, cacheDist, { recursive: true, force: true });
-    }
-  } catch (e) {
-    // silently skip — user can manually sync if needed
-  }
-
   // Start or reuse proxy
   const proxy = await startProxy(configDir, config);
 

@@ -13,11 +13,12 @@
   "files": [
     "dist/",
     "bin/",
+    "scripts/",
     "README.md"
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "npm run build"
+    "prepare": "npm run build && node scripts/sync-cache.js"
   },
   "keywords": [
     "opencode",

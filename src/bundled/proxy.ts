@@ -486,7 +486,14 @@ function forwardToDjango(req, body, callback) {
   const startTime = Date.now();
   log('forwardToDjango -> ' + options.method + ' ' + options.hostname + ':' + options.port + options.path);
 
+  let timeoutCleared = false;
   const djangoReq = REQUester.request(options, (djangoRes) => {
+    // Response started; clear the connect/first-byte timeout so slow streams aren't killed.
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
+
     let responseBody = '';
     djangoRes.on('data', chunk => { responseBody += chunk; });
     djangoRes.on('end', () => {
@@ -496,12 +503,16 @@ function forwardToDjango(req, body, callback) {
     });
   });
 
-  djangoReq.setTimeout(30000, () => {
+  djangoReq.setTimeout(300000, () => {
     djangoReq.destroy();
-    callback(new Error('Django request timed out after 30s'));
+    callback(new Error('Django request timed out after 300s'));
   });
 
   djangoReq.on('error', (err) => {
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
     log('Django request error: ' + err.message);
     callback(err);
   });
@@ -527,7 +538,14 @@ function forwardStreaming(req, res, body, callback) {
   const startTime = Date.now();
   log('forwardStreaming -> ' + options.method + ' ' + options.hostname + ':' + options.port + options.path);
 
+  let timeoutCleared = false;
   const djangoReq = REQUester.request(options, (djangoRes) => {
+    // Response started; clear the connect/first-byte timeout so slow streams aren't killed.
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
+
     const elapsed = Date.now() - startTime;
     log('Django response started in ' + elapsed + 'ms: status=' + djangoRes.statusCode);
 
@@ -546,42 +564,130 @@ function forwardStreaming(req, res, body, callback) {
       'Connection': 'keep-alive',
     });
 
-    // Keepalive until first chunk of actual response
-    let gotFirstChunk = false;
-    const keepalive = setInterval(() => {
-      if (!gotFirstChunk) {
-        sseLine(res, {
-          id: 'ka-' + Date.now(),
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
-        });
-      }
-    }, 2000);
+    if (res.socket) {
+      res.socket.setNoDelay(true);
+    }
 
-    djangoRes.on('data', () => {
-      if (!gotFirstChunk) {
-        gotFirstChunk = true;
-        clearInterval(keepalive);
+    // Buffer SSE data at event boundaries and inject keepalive between events.
+    // Uses sseLine() for keepalive (valid JSON data events, not :ok comments).
+    let sseBuffer = '';
+    let lastActivity = Date.now();
+    let streamingDone = false;
+
+    // Watchdog: inject keepalive only when buffer is empty (between complete events)
+    const keepaliveTimer = setInterval(() => {
+      if (streamingDone || res.writableEnded || res.destroyed) {
+        clearInterval(keepaliveTimer);
+        return;
+      }
+      const now = Date.now();
+      if (now - lastActivity >= 2000 && sseBuffer.length === 0) {
+        try {
+          sseLine(res, {
+            id: 'ka-' + Date.now(),
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { content: '' }, finish_reason: null }],
+          });
+          lastActivity = now;
+        } catch (err) {
+          log('Keepalive write error: ' + err.message);
+          clearInterval(keepaliveTimer);
+        }
+      }
+    }, 500);
+
+    const cleanup = () => {
+      streamingDone = true;
+      clearInterval(keepaliveTimer);
+    };
+
+    var diagCounter = 0;
+    djangoRes.on('data', (chunk) => {
+      var chunkStr = chunk.toString();
+      var chunkIdx = ++diagCounter;
+      sseBuffer += chunkStr;
+      lastActivity = Date.now();
+
+      var okCount = (sseBuffer.match(/:ok/g) || []).length;
+      if (okCount > 0) {
+        log('CHUNK#' + chunkIdx + ': ' + okCount + ' :ok in buffer (len=' + sseBuffer.length + ')');
+      }
+
+      // Strip upstream SSE ":ok" keepalive comments from anywhere in the buffer.
+      sseBuffer = sseBuffer.replace(/:ok(?:\\n)?/g, '');
+      if (okCount > 0) {
+        log('AFTER: stripped ' + okCount + ' :ok, buffer len=' + sseBuffer.length);
+      }
+
+      var extractedCount = 0;
+      let idx;
+      while ((idx = sseBuffer.indexOf('\\n\\n')) !== -1) {
+        const event = sseBuffer.substring(0, idx + 2);
+        sseBuffer = sseBuffer.substring(idx + 2);
+        const lines = event.split('\\n').filter(l => !/^:/.test(l) && l.length > 0);
+        if (lines.length === 0) continue;
+        const cleanEvent = lines.join('\\n') + '\\n\\n';
+        extractedCount++;
+        var dataContent = lines.map(function(l) { return l.replace(/^data: ?/, ''); }).join('');
+        var lastChar = dataContent.slice(-1);
+        if (dataContent !== '[DONE]' && lastChar !== '}' && lastChar !== ']') {
+          log('FLUSH: truncated event #' + extractedCount + ' (len=' + dataContent.length + ', end=' + JSON.stringify(dataContent.slice(-30)) + ')');
+        }
+        try {
+          res.write(cleanEvent);
+        } catch (err) {
+          cleanup();
+          log('Write error: ' + err.message);
+          return;
+        }
+      }
+      if (extractedCount > 0) {
+        log('EXTRACT: forwarded ' + extractedCount + ' events in chunk#' + chunkIdx + ', buffer remaining len=' + sseBuffer.length);
       }
     });
 
-    djangoRes.pipe(res);
-    
+    djangoRes.on('end', () => {
+      sseBuffer = sseBuffer.replace(/:ok(?:\\n)?/g, '');
+      if (sseBuffer) {
+        // Ensure the final written data ends with \\n\\n so the client recognizes the event boundary
+        if (sseBuffer.length < 2 || sseBuffer.substring(sseBuffer.length - 2) !== '\\n\\n') {
+          sseBuffer += '\\n\\n';
+        }
+        log('END: writing remaining buffer len=' + sseBuffer.length + ' start=' + JSON.stringify(sseBuffer.substring(0, 80)));
+        try { res.write(sseBuffer); } catch (e) {}
+      }
+      cleanup();
+      try { res.end(); } catch (e) {}
+      log('Streaming response completed');
+      callback(null, djangoRes.statusCode, {}, '');
+    });
+
+    djangoRes.on('error', (err) => {
+      cleanup();
+      log('Django stream error: ' + err.message);
+    });
+
     res.on('close', () => {
+      cleanup();
       log('Client connection closed');
     });
-    
-    djangoRes.on('end', () => {
-      callback(null, djangoRes.statusCode, {}, '');
+
+    res.on('error', (err) => {
+      cleanup();
+      log('Client connection error: ' + err.message);
     });
   });
 
-  djangoReq.setTimeout(30000, () => {
+  djangoReq.setTimeout(300000, () => {
     djangoReq.destroy();
-    callback(new Error('Django streaming request timed out after 30s'));
+    callback(new Error('Django streaming request timed out after 300s'));
   });
 
   djangoReq.on('error', (err) => {
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
     log('Django streaming request error: ' + err.message);
     callback(err);
   });
@@ -841,7 +947,7 @@ const server = http.createServer(async (req, res) => {
       
       log('Request received: wallet=' + (walletHash?.substring(0, 16) || 'none') + '..., bodyLen=' + body.length + ', pending=' + pendingPayments.has(walletHash));
       
-      const stripSysRem = (s: string) => { let r = (s || ''), a = '<system-reminder>', b = '</system-reminder>', i = r.indexOf(a); while (i !== -1) { let j = r.indexOf(b, i); if (j === -1) break; r = r.substring(0, i) + r.substring(j + b.length); i = r.indexOf(a); } return r.trim(); };
+      const stripSysRem = (s) => { let r = (s || ''), a = '<system-reminder>', b = '</system-reminder>', i = r.indexOf(a); while (i !== -1) { let j = r.indexOf(b, i); if (j === -1) break; r = r.substring(0, i) + r.substring(j + b.length); i = r.indexOf(a); } return r.trim(); };
       
       // Guard: wallet hash is required for payment flow
       if (!walletHash) {
@@ -851,8 +957,20 @@ const server = http.createServer(async (req, res) => {
       }
       
       // Check if there's a pending payment for this wallet
-      const pendingPayload = pendingPayments.get(walletHash);
+      var pendingPayload = pendingPayments.get(walletHash);
       
+      // If there's a pending payment for a different model, clear it so the
+      // new request can be forwarded fresh to Django.  This prevents the
+      // proxy from re-showing a stale payment prompt when the user switches
+      // to a different model mid-conversation.
+      if (pendingPayload) {
+        var reqModel = '';
+        try { reqModel = JSON.parse(body).model || ''; } catch (e) {}
+        if (reqModel && pendingPayload.modelId && reqModel !== pendingPayload.modelId) {
+          pendingPayments.delete(walletHash);
+          pendingPayload = null;
+        }
+      }
       
       if (pendingPayload) {
         // Check for tier selection first
