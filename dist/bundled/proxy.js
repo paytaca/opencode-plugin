@@ -884,6 +884,62 @@ function getLastUserMessageContent(body) {
   }
 }
 
+async function handleTimeCreditsCommand(res, walletHash) {
+  log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
+  const statusUrl = BACKEND_URL + '/v1/wallet/status';
+  const statusRes = await fetch(statusUrl, {
+    headers: { 'X-Wallet-Hash': walletHash }
+  });
+  let content;
+  if (statusRes.ok) {
+    const statusData = await statusRes.json();
+    const sessions = statusData.sessions || [];
+    const activeSessions = sessions.filter(s => s.time_remaining_seconds > 0 && s.model_active);
+    const inactiveSessions = sessions.filter(s => s.time_remaining_seconds > 0 && !s.model_active);
+    const parts = [];
+    if (activeSessions.length > 0) {
+      parts.push('**⏱️  Active Time Credits:**');
+      activeSessions.forEach(s => {
+        const total = formatDuration(s.time_credits_seconds);
+        const remaining = formatDuration(s.time_remaining_seconds);
+        const used = formatDuration(s.time_used_seconds);
+        parts.push('  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' (' + used + ' used)');
+      });
+    }
+    if (inactiveSessions.length > 0) {
+      parts.push('\\n**⚠️  Inactive Model:**');
+      inactiveSessions.forEach(s => {
+        const remaining = formatDuration(s.time_remaining_seconds);
+        parts.push('  - **' + (s.display_name || s.ai_model) + ' (Inactive)** — ' + remaining + ' remaining');
+      });
+    }
+    content = parts.length > 0 ? parts.join('\\n') : '⏱️  No active time credits.';
+  } else {
+    content = '⏱️  Unable to check time credits.';
+  }
+
+  sseLine(res, {
+    id: 'time-1',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: 'deepseek/deepseek-v4-flash',
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  });
+  sseLine(res, {
+    id: 'time-2',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
+  });
+  sseLine(res, {
+    id: 'time-3',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+  sseDone(res);
+  res.end();
+}
+
 // Main proxy server
 const server = http.createServer(async (req, res) => {
   // Enable CORS
@@ -978,6 +1034,11 @@ const server = http.createServer(async (req, res) => {
         // Check for tier selection first
         if (pendingPayload.step === 'tier_select' && pendingPayload.tiers && pendingPayload.tiers.length > 0) {
           const userInput = stripSysRem(lastContent);
+          const timeCmd = userInput?.trim().toLowerCase();
+          if (timeCmd === 'time' || timeCmd === 'credit' || timeCmd === 'credits') {
+            await handleTimeCreditsCommand(res, walletHash);
+            return;
+          }
           let selectedIndex = -1;
           
           // Try to parse user input as a number (1-based)
@@ -1238,6 +1299,11 @@ const server = http.createServer(async (req, res) => {
           return;
           
         } else {
+          const innerCmd = stripSysRem(lastContent?.trim().toLowerCase());
+          if (innerCmd === 'time' || innerCmd === 'credit' || innerCmd === 'credits') {
+            await handleTimeCreditsCommand(res, walletHash);
+            return;
+          }
           log('New message while payment pending for wallet ' + walletHash?.substring(0, 16) + '...');
         }
       }
@@ -1245,59 +1311,7 @@ const server = http.createServer(async (req, res) => {
       // Handle time/credits command — show remaining time credits
       const cmd = stripSysRem(lastContent?.trim().toLowerCase());
       if (cmd === 'time' || cmd === 'credit' || cmd === 'credits') {
-        log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
-        const statusUrl = BACKEND_URL + '/v1/wallet/status';
-        const statusRes = await fetch(statusUrl, {
-          headers: { 'X-Wallet-Hash': walletHash }
-        });
-        let content;
-        if (statusRes.ok) {
-          const statusData = await statusRes.json();
-          const sessions = statusData.sessions || [];
-          const activeSessions = sessions.filter(s => s.time_remaining_seconds > 0 && s.model_active);
-          const inactiveSessions = sessions.filter(s => s.time_remaining_seconds > 0 && !s.model_active);
-          const parts = [];
-          if (activeSessions.length > 0) {
-            parts.push('**⏱️  Active Time Credits:**');
-            activeSessions.forEach(s => {
-              const total = formatDuration(s.time_credits_seconds);
-              const remaining = formatDuration(s.time_remaining_seconds);
-              const used = formatDuration(s.time_used_seconds);
-              parts.push('  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' (' + used + ' used)');
-            });
-          }
-          if (inactiveSessions.length > 0) {
-            parts.push('\\n**⚠️  Inactive Model:**');
-            inactiveSessions.forEach(s => {
-              const remaining = formatDuration(s.time_remaining_seconds);
-              parts.push('  - **' + (s.display_name || s.ai_model) + ' (Inactive)** — ' + remaining + ' remaining');
-            });
-          }
-          content = parts.length > 0 ? parts.join('\\n') : '⏱️  No active time credits.';
-        } else {
-          content = '⏱️  Unable to check time credits.';
-        }
-        
-        sseLine(res, {
-          id: 'time-1',
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: 'deepseek/deepseek-v4-flash',
-          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-        });
-        sseLine(res, {
-          id: 'time-2',
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
-        });
-        sseLine(res, {
-          id: 'time-3',
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
-        sseDone(res);
-        res.end();
+        await handleTimeCreditsCommand(res, walletHash);
         return;
       }
       
