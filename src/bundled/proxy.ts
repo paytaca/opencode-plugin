@@ -486,7 +486,14 @@ function forwardToDjango(req, body, callback) {
   const startTime = Date.now();
   log('forwardToDjango -> ' + options.method + ' ' + options.hostname + ':' + options.port + options.path);
 
+  let timeoutCleared = false;
   const djangoReq = REQUester.request(options, (djangoRes) => {
+    // Response started; clear the connect/first-byte timeout so slow streams aren't killed.
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
+
     let responseBody = '';
     djangoRes.on('data', chunk => { responseBody += chunk; });
     djangoRes.on('end', () => {
@@ -496,12 +503,16 @@ function forwardToDjango(req, body, callback) {
     });
   });
 
-  djangoReq.setTimeout(30000, () => {
+  djangoReq.setTimeout(300000, () => {
     djangoReq.destroy();
-    callback(new Error('Django request timed out after 30s'));
+    callback(new Error('Django request timed out after 300s'));
   });
 
   djangoReq.on('error', (err) => {
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
     log('Django request error: ' + err.message);
     callback(err);
   });
@@ -527,7 +538,14 @@ function forwardStreaming(req, res, body, callback) {
   const startTime = Date.now();
   log('forwardStreaming -> ' + options.method + ' ' + options.hostname + ':' + options.port + options.path);
 
+  let timeoutCleared = false;
   const djangoReq = REQUester.request(options, (djangoRes) => {
+    // Response started; clear the connect/first-byte timeout so slow streams aren't killed.
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
+
     const elapsed = Date.now() - startTime;
     log('Django response started in ' + elapsed + 'ms: status=' + djangoRes.statusCode);
 
@@ -546,23 +564,131 @@ function forwardStreaming(req, res, body, callback) {
       'Connection': 'keep-alive',
     });
 
-    djangoRes.pipe(res);
-    
+    if (res.socket) {
+      res.socket.setNoDelay(true);
+    }
+
+    // Buffer SSE data at event boundaries and inject keepalive between events.
+    let sseBuffer = '';
+    let lastActivity = Date.now();
+    let streamingDone = false;
+    let doneForwarded = false;
+
+    // Watchdog: inject keepalive only when buffer is empty (between complete events)
+    const keepaliveTimer = setInterval(() => {
+      if (streamingDone || res.writableEnded || res.destroyed) {
+        clearInterval(keepaliveTimer);
+        return;
+      }
+      const now = Date.now();
+      if (now - lastActivity >= 2000 && sseBuffer.length === 0) {
+        try {
+          res.write(': keepalive\\n\\n');
+          lastActivity = now;
+        } catch (err) {
+          log('Keepalive write error: ' + err.message);
+          clearInterval(keepaliveTimer);
+        }
+      }
+    }, 500);
+
+    const cleanup = () => {
+      streamingDone = true;
+      clearInterval(keepaliveTimer);
+    };
+
+    var diagCounter = 0;
+    djangoRes.on('data', (chunk) => {
+      var chunkStr = chunk.toString();
+      var chunkIdx = ++diagCounter;
+      sseBuffer += chunkStr;
+      lastActivity = Date.now();
+
+      var okCount = (sseBuffer.match(/:ok/g) || []).length;
+      if (okCount > 0) {
+        log('CHUNK#' + chunkIdx + ': ' + okCount + ' :ok in buffer (len=' + sseBuffer.length + ')');
+      }
+
+      // Strip upstream SSE ":ok" keepalive comments from anywhere in the buffer.
+      sseBuffer = sseBuffer.replace(/:ok(?:\\n)?/g, '');
+      if (okCount > 0) {
+        log('AFTER: stripped ' + okCount + ' :ok, buffer len=' + sseBuffer.length);
+      }
+
+      var extractedCount = 0;
+      let idx;
+      while ((idx = sseBuffer.indexOf('\\n\\n')) !== -1) {
+        const event = sseBuffer.substring(0, idx + 2);
+        sseBuffer = sseBuffer.substring(idx + 2);
+        const lines = event.split('\\n').filter(l => !/^:/.test(l) && l.length > 0);
+        if (lines.length === 0) continue;
+        const cleanEvent = lines.join('\\n') + '\\n\\n';
+        extractedCount++;
+        var dataContent = lines.map(function(l) { return l.replace(/^data: ?/, ''); }).join('');
+        if (dataContent === '[DONE]') { doneForwarded = true; }
+        var lastChar = dataContent.slice(-1);
+        if (dataContent !== '[DONE]' && lastChar !== '}' && lastChar !== ']') {
+          log('FLUSH: truncated event #' + extractedCount + ' (len=' + dataContent.length + ', end=' + JSON.stringify(dataContent.slice(-30)) + ')');
+        }
+        try {
+          res.write(cleanEvent);
+        } catch (err) {
+          cleanup();
+          log('Write error: ' + err.message);
+          return;
+        }
+      }
+      if (extractedCount > 0) {
+        log('EXTRACT: forwarded ' + extractedCount + ' events in chunk#' + chunkIdx + ', buffer remaining len=' + sseBuffer.length);
+      }
+    });
+
+    djangoRes.on('end', () => {
+      sseBuffer = sseBuffer.replace(/:ok(?:\\n)?/g, '');
+      if (sseBuffer) {
+        // Ensure the final written data ends with \\n\\n so the client recognizes the event boundary
+        if (sseBuffer.length < 2 || sseBuffer.substring(sseBuffer.length - 2) !== '\\n\\n') {
+          sseBuffer += '\\n\\n';
+        }
+        log('END: writing remaining buffer len=' + sseBuffer.length + ' start=' + JSON.stringify(sseBuffer.substring(0, 80)));
+        try { res.write(sseBuffer); } catch (e) {}
+      }
+      if (!doneForwarded) {
+        log('Injecting [DONE] — upstream closed without sending it');
+        try { res.write('data: [DONE]\\n\\n'); } catch (e) {}
+      }
+      cleanup();
+      try { res.end(); } catch (e) {}
+      log('Streaming response completed' + (doneForwarded ? '' : ' (injected [DONE])'));
+      callback(null, djangoRes.statusCode, {}, '');
+    });
+
+    djangoRes.on('error', (err) => {
+      cleanup();
+      log('Django stream error: ' + err.message);
+    });
+
     res.on('close', () => {
+      cleanup();
       log('Client connection closed');
     });
-    
-    djangoRes.on('end', () => {
-      callback(null, djangoRes.statusCode, {}, '');
+
+    res.on('error', (err) => {
+      cleanup();
+      log('Client connection error: ' + err.message);
     });
   });
 
-  djangoReq.setTimeout(30000, () => {
+  djangoReq.setTimeout(300000, () => {
     djangoReq.destroy();
-    callback(new Error('Django streaming request timed out after 30s'));
+    callback(new Error('Django streaming request timed out after 300s'));
   });
 
   djangoReq.on('error', (err) => {
+    if (!timeoutCleared) {
+      djangoReq.clearTimeout();
+      timeoutCleared = true;
+    }
     log('Django streaming request error: ' + err.message);
     callback(err);
   });
@@ -588,15 +714,16 @@ function jsonToSse(res, chatCompletion) {
   const model = chatCompletion.model || chatCompletion.model_id || 'deepseek/deepseek-v4-flash';
   const created = chatCompletion.created || Math.floor(Date.now() / 1000);
 
-
-  try {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-  } catch (e) {
-    return;
+  if (!res.headersSent) {
+    try {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+    } catch (e) {
+      return;
+    }
   }
 
   try {
@@ -756,6 +883,62 @@ function getLastUserMessageContent(body) {
   }
 }
 
+async function handleTimeCreditsCommand(res, walletHash) {
+  log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
+  const statusUrl = BACKEND_URL + '/v1/wallet/status';
+  const statusRes = await fetch(statusUrl, {
+    headers: { 'X-Wallet-Hash': walletHash }
+  });
+  let content;
+  if (statusRes.ok) {
+    const statusData = await statusRes.json();
+    const sessions = statusData.sessions || [];
+    const activeSessions = sessions.filter(s => s.time_remaining_seconds > 0 && s.model_active);
+    const inactiveSessions = sessions.filter(s => s.time_remaining_seconds > 0 && !s.model_active);
+    const parts = [];
+    if (activeSessions.length > 0) {
+      parts.push('**⏱️  Active Time Credits:**');
+      activeSessions.forEach(s => {
+        const total = formatDuration(s.time_credits_seconds);
+        const remaining = formatDuration(s.time_remaining_seconds);
+        const used = formatDuration(s.time_used_seconds);
+        parts.push('  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' (' + used + ' used)');
+      });
+    }
+    if (inactiveSessions.length > 0) {
+      parts.push('\\n**⚠️  Inactive Model:**');
+      inactiveSessions.forEach(s => {
+        const remaining = formatDuration(s.time_remaining_seconds);
+        parts.push('  - **' + (s.display_name || s.ai_model) + ' (Inactive)** — ' + remaining + ' remaining');
+      });
+    }
+    content = parts.length > 0 ? parts.join('\\n') : '⏱️  No active time credits.';
+  } else {
+    content = '⏱️  Unable to check time credits.';
+  }
+
+  sseLine(res, {
+    id: 'time-1',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: 'deepseek/deepseek-v4-flash',
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  });
+  sseLine(res, {
+    id: 'time-2',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
+  });
+  sseLine(res, {
+    id: 'time-3',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+  sseDone(res);
+  res.end();
+}
+
 // Main proxy server
 const server = http.createServer(async (req, res) => {
   // Enable CORS
@@ -819,9 +1002,9 @@ const server = http.createServer(async (req, res) => {
       const walletHash = req.headers['x-wallet-hash'];
       const lastContent = getLastUserMessageContent(body);
       
-      // DEBUG: Log full body and parsed content
-      
       log('Request received: wallet=' + (walletHash?.substring(0, 16) || 'none') + '..., bodyLen=' + body.length + ', pending=' + pendingPayments.has(walletHash));
+      
+      const stripSysRem = (s) => { let r = (s || ''), a = '<system-reminder>', b = '</system-reminder>', i = r.indexOf(a); while (i !== -1) { let j = r.indexOf(b, i); if (j === -1) break; r = r.substring(0, i) + r.substring(j + b.length); i = r.indexOf(a); } return r.trim(); };
       
       // Guard: wallet hash is required for payment flow
       if (!walletHash) {
@@ -831,13 +1014,30 @@ const server = http.createServer(async (req, res) => {
       }
       
       // Check if there's a pending payment for this wallet
-      const pendingPayload = pendingPayments.get(walletHash);
+      var pendingPayload = pendingPayments.get(walletHash);
       
+      // If there's a pending payment for a different model, clear it so the
+      // new request can be forwarded fresh to Django.  This prevents the
+      // proxy from re-showing a stale payment prompt when the user switches
+      // to a different model mid-conversation.
+      if (pendingPayload) {
+        var reqModel = '';
+        try { reqModel = JSON.parse(body).model || ''; } catch (e) {}
+        if (reqModel && pendingPayload.modelId && reqModel !== pendingPayload.modelId) {
+          pendingPayments.delete(walletHash);
+          pendingPayload = null;
+        }
+      }
       
       if (pendingPayload) {
         // Check for tier selection first
         if (pendingPayload.step === 'tier_select' && pendingPayload.tiers && pendingPayload.tiers.length > 0) {
-          const userInput = lastContent.trim();
+          const userInput = stripSysRem(lastContent);
+          const timeCmd = userInput?.trim().toLowerCase();
+          if (timeCmd === 'time' || timeCmd === 'credit' || timeCmd === 'credits') {
+            await handleTimeCreditsCommand(res, walletHash);
+            return;
+          }
           let selectedIndex = -1;
           
           // Try to parse user input as a number (1-based)
@@ -893,27 +1093,57 @@ const server = http.createServer(async (req, res) => {
               return;
             }
             
+            // Keepalive during payment processing
+            if (!res.headersSent) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Payment-Processing': 'true',
+              });
+            }
+            const keepalive = setInterval(() => {
+              if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
+              res.write(': keepalive\\n\\n');
+            }, 2000);
+
             runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
               pendingPayments.delete(walletHash);
-              
+              clearInterval(keepalive);
+
               if (err) {
                 log('paytaca pay failed: ' + err.message);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                  error: 'Payment failed', 
-                  message: err.message,
-                  details: 'Please check your wallet balance and try again.'
-                }));
+                if (res.headersSent) {
+                  try {
+                    sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
+                    sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                    sseDone(res);
+                    res.end();
+                  } catch (e) {}
+                } else {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+                }
                 return;
               }
               
               if (!responseJson.success) {
-                res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                  error: 'Payment failed', 
-                  message: responseJson.error,
-                  details: 'Payment was not successful. Please check your balance and try again.'
-                }));
+                const isTimeout = responseJson.timeout;
+                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'time\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+                const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
+                const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
+                const errDetails = isTimeout ? 'Try again or check credits with \\'time\\'.' : 'Please check your balance and try again.';
+                if (res.headersSent) {
+                  try {
+                    sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                    sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                    sseDone(res);
+                    res.end();
+                  } catch (e) {}
+                } else {
+                  res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+                }
                 return;
               }
               
@@ -947,7 +1177,7 @@ const server = http.createServer(async (req, res) => {
         }
         
         // Old flow: user responded to a yes/no payment prompt
-        if (lastContent === 'yes') {
+        if (stripSysRem(lastContent) === 'yes') {
           log('Payment approved by wallet ' + walletHash?.substring(0, 16) + '...');
           pendingPayments.delete(walletHash);
           
@@ -959,25 +1189,54 @@ const server = http.createServer(async (req, res) => {
             extraHeaders['X-Duration-Minutes'] = String(pendingPayload.durationMinutes);
           }
           
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'X-Payment-Processing': 'true',
+            });
+          }
+          const keepalive = setInterval(() => {
+            if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
+            res.write(': keepalive\\n\\n');
+          }, 2000);
+
           runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
+            clearInterval(keepalive);
             if (err) {
               log('paytaca pay failed: ' + err.message);
-              res.writeHead(500, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ 
-                error: 'Payment failed', 
-                message: err.message,
-                details: 'Please check your wallet balance and try again.'
-              }));
+              if (res.headersSent) {
+                try {
+                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
+                  sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                  sseDone(res);
+                  res.end();
+                } catch (e) {}
+              } else {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+              }
               return;
             }
             
             if (!responseJson.success) {
-              res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ 
-                error: 'Payment failed', 
-                message: responseJson.error,
-                details: 'Payment was not successful. Please check your balance and try again.'
-              }));
+              const isTimeout = responseJson.timeout;
+              const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'time\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+              const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
+              const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
+              const errDetails = isTimeout ? 'Try again or check credits with \\'time\\'.' : 'Please check your balance and try again.';
+              if (res.headersSent) {
+                try {
+                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                  sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                  sseDone(res);
+                  res.end();
+                } catch (e) {}
+              } else {
+                res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+              }
               return;
             }
             
@@ -1003,7 +1262,7 @@ const server = http.createServer(async (req, res) => {
           });
           return;
           
-        } else if (lastContent === 'no') {
+        } else if (stripSysRem(lastContent) === 'no') {
           log('Payment declined by wallet ' + walletHash?.substring(0, 16) + '...');
           pendingPayments.delete(walletHash);
 
@@ -1031,66 +1290,19 @@ const server = http.createServer(async (req, res) => {
           return;
           
         } else {
+          const innerCmd = stripSysRem(lastContent?.trim().toLowerCase());
+          if (innerCmd === 'time' || innerCmd === 'credit' || innerCmd === 'credits') {
+            await handleTimeCreditsCommand(res, walletHash);
+            return;
+          }
           log('New message while payment pending for wallet ' + walletHash?.substring(0, 16) + '...');
         }
       }
       
       // Handle time/credits command — show remaining time credits
-      const cmd = lastContent?.trim().toLowerCase();
+      const cmd = stripSysRem(lastContent?.trim().toLowerCase());
       if (cmd === 'time' || cmd === 'credit' || cmd === 'credits') {
-        log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
-        const statusUrl = BACKEND_URL + '/v1/wallet/status';
-        const statusRes = await fetch(statusUrl, {
-          headers: { 'X-Wallet-Hash': walletHash }
-        });
-        let content;
-        if (statusRes.ok) {
-          const statusData = await statusRes.json();
-          const sessions = statusData.sessions || [];
-          const activeSessions = sessions.filter(s => s.time_remaining_seconds > 0 && s.model_active);
-          const inactiveSessions = sessions.filter(s => s.time_remaining_seconds > 0 && !s.model_active);
-          const parts = [];
-          if (activeSessions.length > 0) {
-            parts.push('**⏱️  Active Time Credits:**');
-            activeSessions.forEach(s => {
-              const total = formatDuration(s.time_credits_seconds);
-              const remaining = formatDuration(s.time_remaining_seconds);
-              const used = formatDuration(s.time_used_seconds);
-              parts.push('  - **' + (s.display_name || s.ai_model) + '** — ' + remaining + ' remaining of ' + total + ' (' + used + ' used)');
-            });
-          }
-          if (inactiveSessions.length > 0) {
-            parts.push('\\n**⚠️  Inactive Model:**');
-            inactiveSessions.forEach(s => {
-              const remaining = formatDuration(s.time_remaining_seconds);
-              parts.push('  - **' + (s.display_name || s.ai_model) + ' (Inactive)** — ' + remaining + ' remaining');
-            });
-          }
-          content = parts.length > 0 ? parts.join('\\n') : '⏱️  No active time credits.';
-        } else {
-          content = '⏱️  Unable to check time credits.';
-        }
-        
-        sseLine(res, {
-          id: 'time-1',
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: 'deepseek/deepseek-v4-flash',
-          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-        });
-        sseLine(res, {
-          id: 'time-2',
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
-        });
-        sseLine(res, {
-          id: 'time-3',
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
-        sseDone(res);
-        res.end();
+        await handleTimeCreditsCommand(res, walletHash);
         return;
       }
       
