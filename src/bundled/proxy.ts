@@ -644,6 +644,9 @@ function forwardStreaming(req, res, body, callback) {
     });
 
     djangoRes.on('end', () => {
+      if (streamingDone) {
+        return;
+      }
       sseBuffer = sseBuffer.replace(/:ok(?:\\n)?/g, '');
       if (sseBuffer) {
         // Ensure the final written data ends with \\n\\n so the client recognizes the event boundary
@@ -664,8 +667,16 @@ function forwardStreaming(req, res, body, callback) {
     });
 
     djangoRes.on('error', (err) => {
-      cleanup();
       log('Django stream error: ' + err.message);
+      if (!streamingDone) {
+        cleanup();
+      }
+      if (!res.writableEnded) {
+        try {
+          res.end();
+        } catch (e) {}
+      }
+      callback(null, 200, {}, '');
     });
 
     res.on('close', () => {
