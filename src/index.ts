@@ -186,6 +186,24 @@ async function OpencodePlugin(_input?: any, _options?: any) {
           ...(output.headers || {}),
           'X-Wallet-Hash': cachedWalletHash,
         };
+        return;
+      }
+
+      // Last-resort: cachedWalletHash was empty at startup (e.g. the wallet
+      // CLI/keychain wasn't ready at that instant). Re-lookup the wallet now
+      // that a request is being sent — mirrors the pre-v0.1.7 behavior where
+      // the wallet was re-checked per request.
+      try {
+        const wallet = await checkWallet();
+        if (wallet.hash) {
+          cachedWalletHash = wallet.hash;
+          output.headers = {
+            ...(output.headers || {}),
+            'X-Wallet-Hash': cachedWalletHash,
+          };
+        }
+      } catch (e) {
+        // Leave headers untouched — the proxy will surface the missing header.
       }
     },
   };
