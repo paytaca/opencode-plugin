@@ -994,7 +994,8 @@ async function handlePricingCommand(res) {
           const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
           const bch = (sats / 100000000).toFixed(8);
           const php = typeof t.price_php === 'number' ? t.price_php.toFixed(2) : '?.??';
-          return (t.minutes || 0) + ' min — ₱' + php + ' (' + bch + ' BCH)';
+          const dur = (t.minutes || 0) + ' min';
+          return '\u001b[35m' + dur + '\u001b[0m — ₱' + php + ' (' + bch + ' BCH)';
         }).join(' | ');
         lines.push('- **' + (m.display_name || m.id) + '**: ' + row);
       }
