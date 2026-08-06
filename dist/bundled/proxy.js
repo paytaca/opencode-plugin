@@ -1021,8 +1021,19 @@ const server = http.createServer(async (req, res) => {
       
       // Guard: wallet hash is required for payment flow
       if (!walletHash) {
+        const redactedHeaders = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          const lk = k.toLowerCase();
+          redactedHeaders[k] = /authorization|payment-signature|api-?key|secret|token/i.test(lk)
+            ? '<redacted>'
+            : v;
+        }
+        log('MISSING X-Wallet-Hash. Received headers: ' + JSON.stringify(redactedHeaders));
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'X-Wallet-Hash header required' }));
+        res.end(JSON.stringify({
+          error: 'X-Wallet-Hash header missing',
+          message: 'The X-Wallet-Hash header was not sent by the client. It is injected by the paytaca opencode plugin (provider options.headers / chat.headers). Reinstall or restart the plugin, or run paytaca wallet info and verify the plugin loaded.',
+        }));
         return;
       }
       

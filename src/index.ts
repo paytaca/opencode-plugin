@@ -22,19 +22,40 @@ async function OpencodePlugin(_input?: any, _options?: any) {
   }
 
   // Ensure wallet exists (auto-create if needed)
+  let walletHashSource: 'cli' | 'config' | 'missing' = 'missing';
   let cachedWalletHash = '';
   try {
     const wallet = await ensureWallet();
 
-    // Save wallet hash to config
+    // Fresh hash parsed from paytaca CLI at load
     if (wallet.hash) {
       config.walletHash = wallet.hash;
       cachedWalletHash = wallet.hash;
+      walletHashSource = 'cli';
       saveConfig(configDir, config);
+    } else {
+      // CLI had no hash (e.g. keychain unreachable) — fall back to the
+      // hash we persisted on a previous successful run, if any.
+      cachedWalletHash = config.walletHash || '';
+      walletHashSource = cachedWalletHash ? 'config' : 'missing';
     }
   } catch (err: any) {
     console.error('Wallet setup failed:', err.message);
-    return {};
+
+    // Even if wallet setup threw, try to fall back to a previously
+    // persisted wallet hash so we don't fail closed when the CLI is
+    // temporarily unreachable but we already know the wallet.
+    cachedWalletHash = config.walletHash || '';
+    walletHashSource = cachedWalletHash ? 'config' : 'missing';
+    if (!cachedWalletHash) {
+      return {};
+    }
+  }
+
+  if (walletHashSource === 'missing') {
+    console.error('⚠️  No Paytaca wallet hash available. X-Wallet-Hash will NOT be sent. Reinstall/restart the plugin or run: paytaca wallet info');
+  } else {
+    console.log(`🔑 Wallet hash source: ${walletHashSource}`);
   }
 
   // Auto-create paytaca-ai credential so OpenCode never prompts for an API key
@@ -143,11 +164,29 @@ async function OpencodePlugin(_input?: any, _options?: any) {
         },
         models,
       };
+
+      // Inject X-Wallet-Hash into the provider's options.headers so it is
+      // forwarded reliably by the AI SDK (matches the mechanism the older
+      // opencode.json setup used). Only set when we have a hash, so a
+      // hardcoded header in the user's own opencode.json is preserved.
+      if (cachedWalletHash) {
+        const existing = (cfg.provider['paytaca-ai'].options as any).headers || {};
+        (cfg.provider['paytaca-ai'].options as any).headers = {
+          ...existing,
+          'X-Wallet-Hash': cachedWalletHash,
+        };
+      }
     },
     "chat.headers": async (_input: any, output: any) => {
-      output.headers = {
-        'X-Wallet-Hash': cachedWalletHash || '',
-      };
+      // Secondary fallback delivery path. Never send an empty value —
+      // opencode/SDK may strip an empty header, which would make the
+      // proxy report a missing X-Wallet-Hash.
+      if (cachedWalletHash) {
+        output.headers = {
+          ...(output.headers || {}),
+          'X-Wallet-Hash': cachedWalletHash,
+        };
+      }
     },
   };
 }
