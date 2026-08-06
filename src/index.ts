@@ -54,8 +54,6 @@ async function OpencodePlugin(_input?: any, _options?: any) {
 
   if (walletHashSource === 'missing') {
     console.error('⚠️  No Paytaca wallet hash available. X-Wallet-Hash will NOT be sent. Reinstall/restart the plugin or run: paytaca wallet info');
-  } else {
-    console.log(`🔑 Wallet hash source: ${walletHashSource}`);
   }
 
   // Auto-create paytaca-ai credential so OpenCode never prompts for an API key
