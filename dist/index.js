@@ -156,9 +156,20 @@ async function OpencodePlugin(_input, _options) {
                     const backendConfig = await response.json();
                     const configData = backendConfig;
                     if (configData.models && Array.isArray(configData.models)) {
+                        const tierLabel = (t) => {
+                            const k = String(t || '').toLowerCase();
+                            if (k === 'budget')
+                                return 'Budget';
+                            if (k === 'premium')
+                                return 'Premium';
+                            if (k === 'frontier')
+                                return 'Frontier';
+                            return '';
+                        };
                         for (const model of configData.models) {
+                            const suffix = tierLabel(model.tier);
                             models[model.id] = {
-                                name: model.display_name || model.id,
+                                name: (model.display_name || model.id) + (suffix ? ' (' + suffix + ')' : ''),
                                 limit: {
                                     context: 128000,
                                     output: 8192,

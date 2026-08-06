@@ -952,6 +952,87 @@ async function handleTimeCreditsCommand(res, walletHash) {
   res.end();
 }
 
+const isTimeCmd = (s) => s === 'time' || s === 'credit' || s === 'credits';
+const isPricingCmd = (s) => s === 'pricing' || s === 'plans';
+
+// List all models grouped by tier (Budget / Premium / Frontier / Other) with prices
+async function handlePricingCommand(res) {
+  log('Pricing command requested');
+  let content;
+  try {
+    const configRes = await fetch(BACKEND_URL + '/v1/config');
+    if (!configRes.ok) {
+      throw new Error('config status ' + configRes.status);
+    }
+    const config = await configRes.json();
+    const models = Array.isArray(config.models) ? config.models : [];
+    const groups = { budget: [], premium: [], frontier: [], other: [] };
+    for (const m of models) {
+      const key = String(m.tier || '').toLowerCase();
+      const groupKey = (key === 'budget' || key === 'premium' || key === 'frontier') ? key : 'other';
+      groups[groupKey].push(m);
+    }
+    const lines = ['📋 Paytaca AI — Model Pricing'];
+    const order = [
+      { key: 'budget', label: 'Budget' },
+      { key: 'premium', label: 'Premium' },
+      { key: 'frontier', label: 'Frontier' },
+      { key: 'other', label: 'Other' },
+    ];
+    let any = false;
+    for (const g of order) {
+      if (groups[g.key].length === 0) continue;
+      any = true;
+      lines.push('');
+      lines.push('**' + g.label + '**');
+      for (const m of groups[g.key]) {
+        const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
+        if (tiers.length === 0) {
+          lines.push('- **' + (m.display_name || m.id) + '**: — no pricing configured');
+          continue;
+        }
+        const sorted = tiers.slice().sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+        const row = sorted.map(t => {
+          const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
+          const bch = (sats / 100000000).toFixed(8);
+          const php = typeof t.price_php === 'number' ? t.price_php.toFixed(2) : '?.??';
+          return (t.minutes || 0) + ' min — ₱' + php + ' (' + bch + ' BCH)';
+        }).join(' | ');
+        lines.push('- **' + (m.display_name || m.id) + '**: ' + row);
+      }
+    }
+    if (!any) {
+      lines.push('');
+      lines.push('No models available.');
+    }
+    content = lines.join('\\n');
+  } catch (err) {
+    log('Pricing command failed: ' + err.message);
+    content = '📋 Unable to fetch pricing.';
+  }
+
+  sseLine(res, {
+    id: 'price-1',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: 'deepseek/deepseek-v4-flash',
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  });
+  sseLine(res, {
+    id: 'price-2',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
+  });
+  sseLine(res, {
+    id: 'price-3',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+  sseDone(res);
+  res.end();
+}
+
 // Main proxy server
 const server = http.createServer(async (req, res) => {
   // Enable CORS
@@ -1058,8 +1139,12 @@ const server = http.createServer(async (req, res) => {
         if (pendingPayload.step === 'tier_select' && pendingPayload.tiers && pendingPayload.tiers.length > 0) {
           const userInput = stripSysRem(lastContent);
           const timeCmd = userInput?.trim().toLowerCase();
-          if (timeCmd === 'time' || timeCmd === 'credit' || timeCmd === 'credits') {
+          if (isTimeCmd(timeCmd)) {
             await handleTimeCreditsCommand(res, walletHash);
+            return;
+          }
+          if (isPricingCmd(timeCmd)) {
+            await handlePricingCommand(res);
             return;
           }
           let selectedIndex = -1;
@@ -1315,8 +1400,12 @@ const server = http.createServer(async (req, res) => {
           
         } else {
           const innerCmd = stripSysRem(lastContent?.trim().toLowerCase());
-          if (innerCmd === 'time' || innerCmd === 'credit' || innerCmd === 'credits') {
+          if (isTimeCmd(innerCmd)) {
             await handleTimeCreditsCommand(res, walletHash);
+            return;
+          }
+          if (isPricingCmd(innerCmd)) {
+            await handlePricingCommand(res);
             return;
           }
           log('New message while payment pending for wallet ' + walletHash?.substring(0, 16) + '...');
@@ -1325,8 +1414,13 @@ const server = http.createServer(async (req, res) => {
       
       // Handle time/credits command — show remaining time credits
       const cmd = stripSysRem(lastContent?.trim().toLowerCase());
-      if (cmd === 'time' || cmd === 'credit' || cmd === 'credits') {
+      if (isTimeCmd(cmd)) {
         await handleTimeCreditsCommand(res, walletHash);
+        return;
+      }
+      // Handle pricing command — show all models grouped by tier
+      if (isPricingCmd(cmd)) {
+        await handlePricingCommand(res);
         return;
       }
       
