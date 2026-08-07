@@ -254,12 +254,12 @@ async function stopProxy(configDir) {
     }
     catch { }
 }
-async function waitForProxy(port, timeout = 10000) {
+async function waitForProxy(port, timeout = 30000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
         try {
             const response = await fetch(`http://localhost:${port}/v1/config`, {
-                signal: AbortSignal.timeout(1000)
+                signal: AbortSignal.timeout(8000)
             });
             if (response.ok) {
                 return;

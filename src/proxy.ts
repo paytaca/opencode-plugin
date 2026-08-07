@@ -250,13 +250,13 @@ export async function stopProxy(configDir: string): Promise<void> {
   } catch {}
 }
 
-async function waitForProxy(port: number, timeout: number = 10000): Promise<void> {
+async function waitForProxy(port: number, timeout: number = 30000): Promise<void> {
   const start = Date.now();
   
   while (Date.now() - start < timeout) {
     try {
       const response = await fetch(`http://localhost:${port}/v1/config`, {
-        signal: AbortSignal.timeout(1000)
+        signal: AbortSignal.timeout(8000)
       });
       if (response.ok) {
         return;
