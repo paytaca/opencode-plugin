@@ -249,17 +249,17 @@ async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
   sseLine(res, {
     id: 'tier-9',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '💳 Select a plan for ' + (modelName || 'AI Model') + '\\n\\n' }, finish_reason: null }],
+    choices: [{ index: 0, delta: { content: '💳 Select a plan for **' + (modelName || 'AI Model') + '**\\n\\n' }, finish_reason: null }],
   });
 
   for (let i = 0; i < tiers.length; i++) {
     const tier = tiers[i];
     const bchAmount = (tier.price_sats / 100000000).toFixed(8);
-    const label = String(i + 1) + '️⃣   ';
+    const label = '\`(' + String(i + 1) + ')\`  ';
     sseLine(res, {
       id: 'tier-10-' + i,
       object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: label + tier.minutes + ' minutes — ₱' + tier.price_php.toFixed(2) + ' (' + bchAmount + ' BCH)\\n' }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: label + tier.minutes + ' minutes — PHP ' + tier.price_php.toFixed(2) + ' (' + bchAmount + ' BCH)\\n' }, finish_reason: null }],
     });
   }
 
@@ -281,7 +281,9 @@ async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
 }
 
 // Build and stream SSE loading sequence + payment prompt
-async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUsed = 0, tokenLimit = 50000, timeRemainingSeconds = 0) {
+// Stream SSE notice when the upstream (OpenRouter) account lacks balance to fund
+// the request. Replaces the old single-tier yes/no approval prompt.
+async function streamLowBalanceNotice(res, modelName) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -289,184 +291,27 @@ async function streamPaymentPrompt(res, walletHash, isRenewal = false, tokensUse
     'Connection': 'keep-alive',
   });
 
-  // Fetch dynamic pricing from backend config
-  let costPhp = 10.00;
-  let costBch = '0.00080000';
-  let costSats = 80000;
-  let usingDefaultRate = false;
-  
-  try {
-    const configRes = await fetch(BACKEND_URL + '/v1/config');
-    if (configRes.ok) {
-      const config = await configRes.json();
-      costPhp = config.cost_php || 10.00;
-      costBch = config.cost_bch || '0.00080000';
-      costSats = config.cost_sats || 80000;
-    }
-  } catch (e) {
-    // Backend unreachable — will warn user below
-    usingDefaultRate = true;
-  }
-  
-  const baseId = isRenewal ? 'renewal' : 'payment';
-
   sseLine(res, {
-    id: baseId + '-1',
+    id: 'lb-1',
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
-    model: 'deepseek/deepseek-v4-flash',
+    model: modelName || 'AI Model',
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
   });
 
-  let balanceStr;
-  let hasCli, hasWallet, balanceSats;
-
-  if (isRenewal) {
-    // For renewals, skip the full loading sequence and fetch balance quietly
-    hasCli = await checkPaytacaCli();
-    hasWallet = hasCli ? await checkWallet() : false;
-    balanceSats = hasWallet ? await getWalletBalance() : null;
-    if (balanceSats !== null) {
-      balanceStr = (balanceSats / 100000000).toFixed(8) + ' BCH';
-    } else {
-      balanceStr = 'Unable to check (try restarting)';
-    }
-  } else {
-    // First-time users: show full loading sequence
-    sseLine(res, {
-      id: baseId + '-2',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: '⏳ Initializing Paytaca AI provider...\\n' }, finish_reason: null }],
-    });
-
-    hasCli = await checkPaytacaCli();
-    sseLine(res, {
-      id: baseId + '-3',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Checking Paytaca CLI... ' }, finish_reason: null }],
-    });
-    sseLine(res, {
-      id: baseId + '-4',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: hasCli ? '✅\\n' : '❌ Not found\\n' }, finish_reason: null }],
-    });
-
-    hasWallet = hasCli ? await checkWallet() : false;
-    sseLine(res, {
-      id: baseId + '-5',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Checking wallet... ' }, finish_reason: null }],
-    });
-    sseLine(res, {
-      id: baseId + '-6',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: hasWallet ? '✅\\n' : '❌ Not found\\n' }, finish_reason: null }],
-    });
-
-    balanceSats = hasWallet ? await getWalletBalance() : null;
-    sseLine(res, {
-      id: baseId + '-7',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Fetching balance... ' }, finish_reason: null }],
-    });
-
-    if (balanceSats !== null) {
-      balanceStr = (balanceSats / 100000000).toFixed(8) + ' BCH';
-      sseLine(res, {
-        id: baseId + '-8',
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: '✅\\n\\n' }, finish_reason: null }],
-      });
-    } else {
-      balanceStr = 'Unable to check (try restarting)';
-      sseLine(res, {
-        id: baseId + '-8',
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: '❌\\n\\n' }, finish_reason: null }],
-      });
-    }
-  }
-
-  let promptHeader = isRenewal
-    ? '💳 Session Expired — Payment Required to Continue\\n\\n'
-    : '💳 Paytaca AI — Payment Required\\n\\n';
-  
   sseLine(res, {
-    id: baseId + '-9',
+    id: 'lb-2',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: promptHeader }, finish_reason: null }],
+    choices: [{ index: 0, delta: { content: '⚠️ OpenRouter balance is low — please top up before continuing.\\n' }, finish_reason: 'stop' }],
   });
-  
+
   sseLine(res, {
-    id: baseId + '-10',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Cost: ' + costPhp.toFixed(2) + ' PHP (~' + costBch + ' BCH)\\n' }, finish_reason: null }],
-  });
-  
-  if (usingDefaultRate) {
-    sseLine(res, {
-      id: baseId + '-10b',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: '⚠️ Could not reach backend for live pricing. Using default rate.\\n' }, finish_reason: null }],
-    });
-  }
-  
-  if (isRenewal) {
-    const usedMinutes = Math.round(timeRemainingSeconds / 60);
-    const remainingAttr = usedMinutes > 0 ? usedMinutes + ' min remaining' : 'depleted';
-    sseLine(res, {
-      id: baseId + '-11',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Previous Session: ' + tokensUsed.toLocaleString() + ' / ' + tokenLimit.toLocaleString() + ' tokens used\\n' }, finish_reason: null }],
-    });
-    sseLine(res, {
-      id: baseId + '-12',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: '⏱ Time Credits: ' + remainingAttr + '\\n' }, finish_reason: null }],
-    });
-  }
-  
-  sseLine(res, {
-    id: baseId + '-13',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Wallet Balance: ' + balanceStr + '\\n' }, finish_reason: null }],
-  });
-  
-  if (balanceSats !== null) {
-    const affordable = Math.floor(balanceSats / costSats);
-    sseLine(res, {
-      id: baseId + '-14',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'You could afford about ~' + affordable + ' sessions\\n\\n' }, finish_reason: null }],
-    });
-  }
-  
-  if (balanceSats !== null && balanceSats < costSats) {
-    const addr = await getReceivingAddress();
-    if (addr) {
-      sseLine(res, {
-        id: baseId + '-15',
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: '⚠️ Insufficient balance for a session.\\nFund your wallet: ' + addr + '\\nOr run: paytaca receive (in another terminal) for QR code\\n\\n' }, finish_reason: null }],
-      });
-    }
-  }
-  
-  if (balanceSats === null || balanceSats > 0) {
-    sseLine(res, {
-      id: baseId + '-16',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: 'Approve payment? (yes/no)' }, finish_reason: 'stop' }],
-    });
-  }
-  
-  sseLine(res, {
-    id: baseId + '-17',
+    id: 'lb-3',
     object: 'chat.completion.chunk',
     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
-  
+
   sseDone(res);
   res.end();
 }
@@ -952,8 +797,8 @@ async function handleTimeCreditsCommand(res, walletHash) {
   res.end();
 }
 
-const isTimeCmd = (s) => s === 'time' || s === 'credit' || s === 'credits';
-const isPricingCmd = (s) => s === 'pricing' || s === 'plans';
+const isTimeCmd = (s) => s === 'credits';
+const isPricingCmd = (s) => s === 'plans';
 
 // List all models grouped by tier (Budget / Premium / Frontier / Other) with prices
 async function handlePricingCommand(res) {
@@ -984,22 +829,22 @@ async function handlePricingCommand(res) {
       if (groups[g.key].length === 0) continue;
       any = true;
       lines.push('');
-      lines.push('**' + g.label + '**');
+      lines.push(g.label);
       for (const m of groups[g.key]) {
+        lines.push('');
         const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
         if (tiers.length === 0) {
           lines.push('- **' + (m.display_name || m.id) + '**: — no pricing configured');
           continue;
         }
         const sorted = tiers.slice().sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
-        const row = sorted.map(t => {
+        lines.push('**' + (m.display_name || m.id) + '**:');
+        sorted.forEach((t, i) => {
           const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
           const bch = (sats / 100000000).toFixed(8);
           const php = typeof t.price_php === 'number' ? t.price_php.toFixed(2) : '?.??';
-          const dur = (t.minutes || 0) + ' min';
-          return '\u001b[35m' + dur + '\u001b[0m — ₱' + php + ' (' + bch + ' BCH)';
-        }).join(' | ');
-        lines.push('- **' + (m.display_name || m.id) + '**: ' + row);
+          lines.push('  \`(' + String(i + 1) + ')\`  ' + (t.minutes || 0) + ' minutes — PHP ' + php + ' (' + bch + ' BCH)');
+        });
       }
     }
     if (!any) {
@@ -1239,10 +1084,10 @@ const server = http.createServer(async (req, res) => {
               
               if (!responseJson.success) {
                 const isTimeout = responseJson.timeout;
-                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'time\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'credits\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
                 const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
                 const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
-                const errDetails = isTimeout ? 'Try again or check credits with \\'time\\'.' : 'Please check your balance and try again.';
+                const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
                 if (res.headersSent) {
                   try {
                     sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
@@ -1332,10 +1177,10 @@ const server = http.createServer(async (req, res) => {
             
             if (!responseJson.success) {
               const isTimeout = responseJson.timeout;
-              const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'time\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+              const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'credits\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
               const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
               const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
-              const errDetails = isTimeout ? 'Try again or check credits with \\'time\\'.' : 'Please check your balance and try again.';
+              const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
               if (res.headersSent) {
                 try {
                   sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
@@ -1413,7 +1258,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       
-      // Handle time/credits command — show remaining time credits
+      // Handle credits command — show remaining time credits
       const cmd = stripSysRem(lastContent?.trim().toLowerCase());
       if (isTimeCmd(cmd)) {
         await handleTimeCreditsCommand(res, walletHash);
@@ -1439,7 +1284,11 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (statusCode === 402) {
-          log('402 intercepted for wallet ' + walletHash?.substring(0, 16) + '...');
+          let requestModel = null;
+          try { requestModel = JSON.parse(body).model || null; } catch (e) {}
+          log('402 intercepted for wallet ' + walletHash?.substring(0, 16)
+            + ' x-model-id=' + (req.headers['x-model-id'] || 'null')
+            + ' body.model=' + (requestModel || 'null'));
           
           // Parse 402 response for model_id and price_tiers
           let modelId = null;
@@ -1450,6 +1299,11 @@ const server = http.createServer(async (req, res) => {
             modelId = parsed.model_id || null;
             displayName = parsed.display_name || null;
             tiers = parsed.price_tiers || null;
+            log('402 body: model=' + (modelId || 'null')
+              + ' display=' + (displayName || 'null')
+              + ' tiers=' + (Array.isArray(tiers) ? tiers.length : String(tiers))
+              + ' reason=' + (parsed.reason || 'n/a')
+              + ' bodyPrefix=' + responseBody.substring(0, 160).replace(/\\n/g, ' '));
           } catch (e) {
             log('Could not parse 402 body: ' + e.message);
           }
@@ -1475,6 +1329,7 @@ const server = http.createServer(async (req, res) => {
           let timeRemainingSeconds = 0;
           
           let statusModelId = modelId;
+          let statusSnapshot = null;
           try {
             // Extract model from the original request body if not in 402
             if (!statusModelId) {
@@ -1507,6 +1362,7 @@ const server = http.createServer(async (req, res) => {
             });
             
             if (statusResponse) {
+              statusSnapshot = statusResponse;
               tokensUsed = statusResponse.tokens_used || 0;
               tokenLimit = statusResponse.token_limit || 50000;
               timeRemainingSeconds = statusResponse.time_remaining_seconds || 0;
@@ -1519,7 +1375,14 @@ const server = http.createServer(async (req, res) => {
             log('Failed to check session status: ' + err.message);
           }
           
-          await streamPaymentPrompt(res, walletHash, isRenewal, tokensUsed, tokenLimit, timeRemainingSeconds);
+          log('402 status model=' + (statusModelId || 'null')
+            + ' snapshot=' + JSON.stringify(statusSnapshot)
+            + ' isRenewal=' + isRenewal
+            + ' timeRemaining=' + timeRemainingSeconds
+            + ' tokensUsed=' + tokensUsed
+            + ' tokenLimit=' + tokenLimit);
+          
+          await streamLowBalanceNotice(res, displayName || statusModelId || modelId || 'AI Model');
         } else {
           if (res.headersSent) {
             log('Streaming response completed and already sent');
