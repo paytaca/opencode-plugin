@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "npm run build && node scripts/sync-cache.js"
+    "prepare": "npm run build && node scripts/sync-cache.js",
+    "postinstall": "node scripts/postinstall.js"
   },
   "keywords": [
     "opencode",
