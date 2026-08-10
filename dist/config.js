@@ -84,6 +84,7 @@ function loadConfig(configDir) {
                 proxyPort: parsed.proxyPort || exports.DEFAULT_PROXY_PORT,
                 walletHash: parsed.walletHash,
                 proxyPid: parsed.proxyPid,
+                proxyScriptHash: parsed.proxyScriptHash,
             };
         }
         catch (err) {

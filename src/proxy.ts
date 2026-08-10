@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { spawn, execSync } from 'child_process';
 import { Config, ProxyInfo } from './types';
 import { 
@@ -74,6 +75,10 @@ function getPaytacaCommand(): string {
 
 export async function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
+    // Bind EXACTLY like the proxy does (no host -> wildcard / dual-stack).
+    // Probing only 127.0.0.1 would miss an existing proxy listener on the
+    // IPv6 wildcard address (Node's default listen()), making findAvailablePort
+    // hand out a port that's actually in use (-> EADDRINUSE on spawn).
     const server = require('net').createServer();
     server.once('error', () => {
       resolve(false);
@@ -82,8 +87,72 @@ export async function isPortAvailable(port: number): Promise<boolean> {
       server.close();
       resolve(true);
     });
-    server.listen(port, '127.0.0.1');
+    server.listen(port);
   });
+}
+
+// Wait until a port is free (or the timeout elapses). Used after killing an
+// outdated proxy so the replacement can bind the same port.
+async function waitForPortFree(port: number, timeout: number = 10000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (await isPortAvailable(port)) {
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+  return false;
+}
+
+// Hash of the bundled proxy script so we can detect when the code changed and
+// restart a running proxy instead of silently reusing stale code.
+function scriptHash(): string {
+  return crypto.createHash('sha1').update(PROXY_SCRIPT_CONTENT).digest('hex');
+}
+
+// Persist the pid file + config so every future lookup points at the current
+// (known-good) proxy. Centralizes the bookkeeping.
+function persistProxyInfo(configDir: string, config: Config, port: number, pid: number, currentHash: string): void {
+  fs.writeFileSync(getPidFile(configDir), pid.toString());
+  config.proxyPort = port;
+  config.proxyPid = pid;
+  config.proxyScriptHash = currentHash;
+  saveConfig(configDir, config);
+}
+
+// Keep the heartbeat file fresh so the proxy doesn't shut itself down.
+function startHeartbeatUpdates(configDir: string): void {
+  const heartbeatFile = getHeartbeatFile(configDir);
+  fs.writeFileSync(heartbeatFile, Date.now().toString());
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+  }
+  heartbeatInterval = setInterval(() => {
+    try {
+      fs.writeFileSync(heartbeatFile, Date.now().toString());
+    } catch {}
+  }, 5000);
+}
+
+// Reuse an existing (fresh) proxy: correct pid file + config, keep heartbeat
+// alive, and hand its port back to the caller.
+async function reuseExistingProxy(configDir: string, config: Config, status: { port: number; pid: number }, currentHash: string): Promise<ProxyInfo> {
+  persistProxyInfo(configDir, config, status.port, status.pid, currentHash);
+  startHeartbeatUpdates(configDir);
+  return { port: status.port, pid: status.pid };
+}
+
+// If a healthy proxy running the current code already exists (e.g. another
+// opencode window won the spawn race), adopt it instead of spawning a second
+// one. Returns null when no suitable proxy is found.
+async function tryAdoptExistingFreshProxy(configDir: string, config: Config, currentHash: string): Promise<ProxyInfo | null> {
+  const status = await getProxyStatus(configDir);
+  if (status.running && status.pid && status.port && status.pid > 0 &&
+      loadConfig(configDir).proxyScriptHash === currentHash) {
+    console.log(`[paytaca] Using existing proxy (pid ${status.pid}, port ${status.port}) that started during this session.`);
+    return await reuseExistingProxy(configDir, config, { port: status.port, pid: status.pid }, currentHash);
+  }
+  return null;
 }
 
 export async function findAvailablePort(startPort: number = 8001, endPort: number = 8010): Promise<number> {
@@ -125,7 +194,6 @@ export async function getProxyStatus(configDir: string): Promise<{ running: bool
 }
 
 export async function startProxy(configDir: string, config: Config): Promise<ProxyInfo> {
-  const pidFile = getPidFile(configDir);
   const proxyScript = getProxyScript(configDir);
   const logFile = getLogFile(configDir);
   const wrapperScript = getWrapperScript(configDir);
@@ -133,95 +201,141 @@ export async function startProxy(configDir: string, config: Config): Promise<Pro
   // Ensure config directory exists
   ensureConfigDir(configDir);
   
+  // Detect if the running proxy was started from different code than this build
+  const currentHash = scriptHash();
+  const persistedConfig = loadConfig(configDir);
+  
+  // Check if proxy already running
+  let existingStatus = await getProxyStatus(configDir);
+  
+  // A running proxy is stale if it was spawned before the current code hash
+  // was persisted (i.e. the bundled script has changed since it was started).
+  const needsRestart = existingStatus.running &&
+    (existingStatus.pid || 0) > 0 &&
+    persistedConfig.proxyScriptHash !== currentHash;
+  
   // Always rewrite proxy script so code changes take effect on next restart
   fs.writeFileSync(proxyScript, PROXY_SCRIPT_CONTENT, 'utf8');
   fs.chmodSync(proxyScript, '755');
   
-  // Check if proxy already running
-  const existingStatus = await getProxyStatus(configDir);
-  if (existingStatus.running && existingStatus.pid && existingStatus.port) {
-    // Just reuse existing proxy, update heartbeat
-    const heartbeatFile = getHeartbeatFile(configDir);
-    fs.writeFileSync(heartbeatFile, Date.now().toString());
-    
-    // Start heartbeat updates
-    if (heartbeatInterval) {
-      clearInterval(heartbeatInterval);
-    }
-    heartbeatInterval = setInterval(() => {
-      try {
-        fs.writeFileSync(heartbeatFile, Date.now().toString());
-      } catch {}
-    }, 5000);
-    
-    return {
-      port: existingStatus.port,
-      pid: existingStatus.pid
-    };
+  if (existingStatus.running && existingStatus.pid && existingStatus.port && !needsRestart) {
+    return await reuseExistingProxy(configDir, config, { port: existingStatus.port, pid: existingStatus.pid }, currentHash);
   }
   
-  // Find available port
-  const port = await findAvailablePort(8001, 8010);
+  // A proxy is running but with outdated code — shut it down so the
+  // replacement can take over (fixes stale code persisting across restarts).
+  if (existingStatus.running && existingStatus.pid) {
+    console.log(`[paytaca] Proxy (pid ${existingStatus.pid}) runs outdated code; restarting with updated script...`);
+    try {
+      process.kill(existingStatus.pid);
+    } catch (e) {
+      console.log(`[paytaca] Could not signal proxy ${existingStatus.pid}: ${(e as Error).message}`);
+    }
+    if (existingStatus.port) {
+      const freed = await waitForPortFree(existingStatus.port);
+      if (!freed) {
+        console.log(`[paytaca] Port ${existingStatus.port} still busy after kill; will use next available port.`);
+      }
+    }
+  }
   
-  // Write bundled wrapper script to config directory
+  // Another window may have started a fresh proxy while we were deciding
+  // (e.g. it won the same-port spawn race) — adopt it rather than double-spawn.
+  const adopted = await tryAdoptExistingFreshProxy(configDir, config, currentHash);
+  if (adopted) {
+    return adopted;
+  }
+  
+  // Write bundled wrapper script to config directory (shared across attempts)
   fs.writeFileSync(wrapperScript, WRAPPER_SCRIPT_CONTENT, 'utf8');
   fs.chmodSync(wrapperScript, '755');
   
   // Start proxy (detached to avoid receiving SIGINT from terminal)
   const paytacaCmd = getPaytacaCommand();
-  const proxy = spawn('node', [
-    proxyScript,
-    config.backendUrl,
-    port.toString()
-  ], {
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      PAYTACA_CMD: paytacaCmd
+  
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const port = await findAvailablePort(8001, 8010);
+    const proxy = spawn('node', [
+      proxyScript,
+      config.backendUrl,
+      port.toString()
+    ], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        PAYTACA_CMD: paytacaCmd
+      }
+    });
+    
+    proxy.unref();
+    
+    if (!proxy.pid) {
+      console.log(`[paytaca] Spawn attempt ${attempt} failed (no PID); retrying...`);
+      continue;
     }
-  });
-  
-  proxy.unref();
-  
-  if (!proxy.pid) {
-    throw new Error('Failed to start proxy: no PID available');
-  }
-  
-  // Write PID file
-  fs.writeFileSync(pidFile, proxy.pid.toString());
-  
-  // Update config - new proxy (preserve wallet hash from passed config)
-  config.proxyPort = port;
-  config.proxyPid = proxy.pid;
-  saveConfig(configDir, config);
-  
-  // Initialize heartbeat file
-  const heartbeatFile = getHeartbeatFile(configDir);
-  fs.writeFileSync(heartbeatFile, Date.now().toString());
-  
-  // Start heartbeat updates
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-  }
-  heartbeatInterval = setInterval(() => {
+    
+    // Track whether OUR child exited — if so the port is served by another
+    // proxy that won the bind race, and we should adopt it instead.
+    let childExited = false;
+    proxy.once('exit', () => { childExited = true; });
+    
+    startHeartbeatUpdates(configDir);
+    
+    // Handle proxy output
+    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+    proxy.stdout?.pipe(logStream);
+    proxy.stderr?.pipe(logStream);
+    
+    const ready = await waitForProxy(port, 15000);
+    
+    if (childExited) {
+      // Our child lost the bind race (EADDRINUSE) or crashed immediately.
+      // Adopt an existing fresh proxy if there is one; otherwise try again.
+      console.log(`[paytaca] Spawned proxy (pid ${proxy.pid}) exited early on port ${port}; checking for an existing proxy...`);
+      const a = await tryAdoptExistingFreshProxy(configDir, config, currentHash);
+      if (a) {
+        return a;
+      }
+      continue;
+    }
+    
+    if (ready) {
+      // Confirm our child is genuinely the one serving (it could have exited
+      // between the readiness poll and here). Persist only when healthy.
+      if (childExited) {
+        const a = await tryAdoptExistingFreshProxy(configDir, config, currentHash);
+        if (a) {
+          return a;
+        }
+        continue;
+      }
+      persistProxyInfo(configDir, config, port, proxy.pid, currentHash);
+      console.log(`[paytaca] Proxy started on port ${port} (pid ${proxy.pid}).`);
+      return { port, pid: proxy.pid };
+    }
+    
+    // Child alive but never became ready — give it one more window, then retry.
+    const ready2 = await waitForProxy(port, 15000);
+    if (ready2 && !childExited) {
+      persistProxyInfo(configDir, config, port, proxy.pid, currentHash);
+      console.log(`[paytaca] Proxy started on port ${port} (pid ${proxy.pid}).`);
+      return { port, pid: proxy.pid };
+    }
+    if (childExited) {
+      const a = await tryAdoptExistingFreshProxy(configDir, config, currentHash);
+      if (a) {
+        return a;
+      }
+    }
+    console.log(`[paytaca] Spawn attempt ${attempt} not ready on port ${port}; retrying...`);
     try {
-      fs.writeFileSync(heartbeatFile, Date.now().toString());
+      process.kill(proxy.pid);
     } catch {}
-  }, 5000);
+  }
   
-  // Handle proxy output
-  const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-  proxy.stdout?.pipe(logStream);
-  proxy.stderr?.pipe(logStream);
-  
-  // Wait for proxy to be ready
-  await waitForProxy(port);
-  
-  return {
-    port,
-    pid: proxy.pid
-  };
+  throw new Error(`Proxy failed to start within ${MAX_ATTEMPTS} attempts`);
 }
 
 export async function stopProxy(configDir: string): Promise<void> {
@@ -250,7 +364,7 @@ export async function stopProxy(configDir: string): Promise<void> {
   } catch {}
 }
 
-async function waitForProxy(port: number, timeout: number = 30000): Promise<void> {
+async function waitForProxy(port: number, timeout: number = 30000): Promise<boolean> {
   const start = Date.now();
   
   while (Date.now() - start < timeout) {
@@ -259,7 +373,7 @@ async function waitForProxy(port: number, timeout: number = 30000): Promise<void
         signal: AbortSignal.timeout(8000)
       });
       if (response.ok) {
-        return;
+        return true;
       }
     } catch {
       // Not ready yet
@@ -267,7 +381,8 @@ async function waitForProxy(port: number, timeout: number = 30000): Promise<void
     await new Promise(resolve => setTimeout(resolve, 500));
   }
   
-  throw new Error(`Proxy failed to start on port ${port} within ${timeout}ms`);
+  console.log(`[paytaca] Proxy did not become ready on port ${port} within ${timeout}ms`);
+  return false;
 }
 
 export async function getProxyConfig(configDir: string): Promise<{ backendUrl: string; port: number } | null> {

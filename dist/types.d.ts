@@ -3,6 +3,7 @@ export interface Config {
     proxyPort: number;
     walletHash?: string;
     proxyPid?: number;
+    proxyScriptHash?: string;
 }
 export interface WalletInfo {
     exists: boolean;
