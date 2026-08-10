@@ -1309,6 +1309,7 @@ const server = http.createServer(async (req, res) => {
           pendingPayments.set(walletHash, {
             body: body,
             modelId: modelId,
+            displayName: displayName,
             durationMinutes: null,
             tiers: tiers,
             step: tiers ? 'tier_select' : 'approval'
