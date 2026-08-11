@@ -81,7 +81,7 @@ Override via `PAYTACA_BACKEND_URL` environment variable (highest priority).
                               └─────────────────┘
 ```
 
-The proxy runs as a detached Node.js process with heartbeat monitoring. It auto-exits after 5 minutes without a heartbeat (when all editor windows close).
+The proxy runs as a detached Node.js process. It stays running from the first OpenCode session until the machine shuts down (or the process is killed with `kill <pid>`), so it survives laptop sleep and subsequent OpenCode launches reuse it — no context loss, faster startup.
 
 ## License
 

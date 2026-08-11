@@ -45,37 +45,6 @@ function log(message) {
   logStream.write(timestamp + ' [Proxy] ' + message + '\\n');
 }
 
-// Heartbeat monitoring - proxy exits if heartbeat is stale
-const HEARTBEAT_FILE = path.join(LOG_DIR, 'heartbeat');
-const HEARTBEAT_TIMEOUT = 300000; // 5 minutes
-
-function checkHeartbeat() {
-  try {
-    if (!fs.existsSync(HEARTBEAT_FILE)) {
-      // No heartbeat file yet, wait a bit
-      return true;
-    }
-    const heartbeat = parseInt(fs.readFileSync(HEARTBEAT_FILE, 'utf8'));
-    if (heartbeat === 0) {
-      // Special value: plugin is stopping
-      log('Heartbeat = 0, shutting down...');
-      return false;
-    }
-    const elapsed = Date.now() - heartbeat;
-    if (elapsed > HEARTBEAT_TIMEOUT) {
-      log('Heartbeat stale (' + elapsed + 'ms), shutting down...');
-      return false;
-    }
-    return true;
-  } catch (err) {
-    // If we can't read heartbeat, keep running (graceful degradation)
-    return true;
-  }
-}
-
-// Heartbeat checker reference (will be started after server creation)
-let heartbeatChecker = null;
-
 // Store pending payment requests per wallet hash
 // Each entry: { body, modelId, displayName, durationMinutes, tiers[], step }
 // step: 'tier_select' (user must pick a tier) or 'approval' (yes/no)
@@ -1430,19 +1399,6 @@ server.listen(PROXY_PORT, () => {
   log('Discovery: http://localhost:' + PROXY_PORT + '/v1/config');
   log('Managed by OpenCode plugin');
 });
-
-// Start heartbeat checker after server is created
-heartbeatChecker = setInterval(() => {
-  if (!checkHeartbeat()) {
-    clearInterval(heartbeatChecker);
-    log('Closing server due to missing heartbeat');
-    server.close(() => {
-      process.exit(0);
-    });
-    // Force exit after 2 seconds if graceful shutdown fails
-    setTimeout(() => process.exit(0), 2000);
-  }
-}, 5000);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

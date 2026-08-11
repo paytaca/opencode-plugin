@@ -3,22 +3,18 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { spawn, execSync } from 'child_process';
 import { Config, ProxyInfo } from './types';
-import { 
-  getConfigDir, 
-  getPidFile, 
-  getProxyScript, 
-  getLogFile, 
+import {
+  getConfigDir,
+  getPidFile,
+  getProxyScript,
+  getLogFile,
   getWrapperScript,
-  getHeartbeatFile,
-  saveConfig, 
+  saveConfig,
   loadConfig,
   ensureConfigDir
 } from './config';
 import { PROXY_SCRIPT_CONTENT } from './bundled/proxy';
 import { WRAPPER_SCRIPT_CONTENT } from './bundled/wrapper';
-
-// Store heartbeat interval reference
-let heartbeatInterval: NodeJS.Timeout | null = null;
 
 // Get path to paytaca binary (multi-strategy resolution)
 function getPaytacaCommand(): string {
@@ -120,25 +116,10 @@ function persistProxyInfo(configDir: string, config: Config, port: number, pid: 
   saveConfig(configDir, config);
 }
 
-// Keep the heartbeat file fresh so the proxy doesn't shut itself down.
-function startHeartbeatUpdates(configDir: string): void {
-  const heartbeatFile = getHeartbeatFile(configDir);
-  fs.writeFileSync(heartbeatFile, Date.now().toString());
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-  }
-  heartbeatInterval = setInterval(() => {
-    try {
-      fs.writeFileSync(heartbeatFile, Date.now().toString());
-    } catch {}
-  }, 5000);
-}
-
-// Reuse an existing (fresh) proxy: correct pid file + config, keep heartbeat
-// alive, and hand its port back to the caller.
+// Reuse an existing (fresh) proxy: correct pid file + config and hand its
+// port back to the caller.
 async function reuseExistingProxy(configDir: string, config: Config, status: { port: number; pid: number }, currentHash: string): Promise<ProxyInfo> {
   persistProxyInfo(configDir, config, status.port, status.pid, currentHash);
-  startHeartbeatUpdates(configDir);
   return { port: status.port, pid: status.pid };
 }
 
@@ -281,8 +262,6 @@ export async function startProxy(configDir: string, config: Config): Promise<Pro
     let childExited = false;
     proxy.once('exit', () => { childExited = true; });
     
-    startHeartbeatUpdates(configDir);
-    
     // Handle proxy output
     const logStream = fs.createWriteStream(logFile, { flags: 'a' });
     proxy.stdout?.pipe(logStream);
@@ -336,32 +315,6 @@ export async function startProxy(configDir: string, config: Config): Promise<Pro
   }
   
   throw new Error(`Proxy failed to start within ${MAX_ATTEMPTS} attempts`);
-}
-
-export async function stopProxy(configDir: string): Promise<void> {
-  // Stop heartbeat updates
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-    heartbeatInterval = null;
-  }
-  
-  // Note: We don't kill the proxy here anymore.
-  // The proxy monitors the heartbeat file and exits itself when stale.
-  // This handles multi-window scenarios correctly.
-  
-  // Optional: Write a special "stopping" timestamp to speed up proxy shutdown
-  const heartbeatFile = getHeartbeatFile(configDir);
-  try {
-    fs.writeFileSync(heartbeatFile, '0');  // Special value: stopping
-    // Remove heartbeat file after a short delay
-    setTimeout(() => {
-      try {
-        if (fs.existsSync(heartbeatFile)) {
-          fs.unlinkSync(heartbeatFile);
-        }
-      } catch {}
-    }, 100);
-  } catch {}
 }
 
 async function waitForProxy(port: number, timeout: number = 30000): Promise<boolean> {
