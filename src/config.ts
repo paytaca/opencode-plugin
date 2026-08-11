@@ -79,28 +79,3 @@ export function getLogFile(configDir: string): string {
 export function getWrapperScript(configDir: string): string {
   return path.join(configDir, 'paytaca-pay-wrapper.mjs');
 }
-
-export function getHeartbeatFile(configDir: string): string {
-  return path.join(configDir, 'heartbeat');
-}
-
-// Touch the heartbeat file to signal the proxy we're still alive
-export function updateHeartbeat(configDir: string): void {
-  const heartbeatFile = getHeartbeatFile(configDir);
-  try {
-    // Write current timestamp
-    fs.writeFileSync(heartbeatFile, Date.now().toString());
-  } catch (err) {
-    // Ignore errors
-  }
-}
-
-// Start heartbeat interval that updates every 5 seconds
-export function startHeartbeat(configDir: string): NodeJS.Timeout {
-  // Update immediately
-  updateHeartbeat(configDir);
-  // Then every 5 seconds
-  return setInterval(() => {
-    updateHeartbeat(configDir);
-  }, 5000);
-}

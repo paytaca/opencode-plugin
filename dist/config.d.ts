@@ -10,7 +10,4 @@ export declare function getPidFile(configDir: string): string;
 export declare function getProxyScript(configDir: string): string;
 export declare function getLogFile(configDir: string): string;
 export declare function getWrapperScript(configDir: string): string;
-export declare function getHeartbeatFile(configDir: string): string;
-export declare function updateHeartbeat(configDir: string): void;
-export declare function startHeartbeat(configDir: string): NodeJS.Timeout;
 //# sourceMappingURL=config.d.ts.map

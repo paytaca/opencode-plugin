@@ -8,7 +8,6 @@ export declare function getProxyStatus(configDir: string): Promise<{
     pid?: number;
 }>;
 export declare function startProxy(configDir: string, config: Config): Promise<ProxyInfo>;
-export declare function stopProxy(configDir: string): Promise<void>;
 export declare function getProxyConfig(configDir: string): Promise<{
     backendUrl: string;
     port: number;

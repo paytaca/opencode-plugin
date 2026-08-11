@@ -43,9 +43,6 @@ exports.getPidFile = getPidFile;
 exports.getProxyScript = getProxyScript;
 exports.getLogFile = getLogFile;
 exports.getWrapperScript = getWrapperScript;
-exports.getHeartbeatFile = getHeartbeatFile;
-exports.updateHeartbeat = updateHeartbeat;
-exports.startHeartbeat = startHeartbeat;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 // Default production backend
@@ -113,28 +110,5 @@ function getLogFile(configDir) {
 }
 function getWrapperScript(configDir) {
     return path.join(configDir, 'paytaca-pay-wrapper.mjs');
-}
-function getHeartbeatFile(configDir) {
-    return path.join(configDir, 'heartbeat');
-}
-// Touch the heartbeat file to signal the proxy we're still alive
-function updateHeartbeat(configDir) {
-    const heartbeatFile = getHeartbeatFile(configDir);
-    try {
-        // Write current timestamp
-        fs.writeFileSync(heartbeatFile, Date.now().toString());
-    }
-    catch (err) {
-        // Ignore errors
-    }
-}
-// Start heartbeat interval that updates every 5 seconds
-function startHeartbeat(configDir) {
-    // Update immediately
-    updateHeartbeat(configDir);
-    // Then every 5 seconds
-    return setInterval(() => {
-        updateHeartbeat(configDir);
-    }, 5000);
 }
 //# sourceMappingURL=config.js.map
