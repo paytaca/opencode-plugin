@@ -15,6 +15,11 @@ import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
+// How long to wait for the server to respond before treating the payment as timed out.
+// Default 240s so heavy non-streaming generations (large context / long output) can
+// complete; override with PAYTACA_PAY_TIMEOUT_MS.
+const PAY_TIMEOUT_MS = Number(process.env.PAYTACA_PAY_TIMEOUT_MS || 240000);
+
 // Find paytaca-cli installation
 function findPaytacaCliPath() {
   const possiblePaths = [];
@@ -111,7 +116,7 @@ async function executePay(url, method, headers, body, bchWallet, x402Payer, isCh
     method,
     headers,
     body: ['POST', 'PUT', 'PATCH'].includes(method) ? body : undefined,
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(PAY_TIMEOUT_MS),
   });
 
   const responseHeaders = {};
@@ -161,7 +166,7 @@ async function executePay(url, method, headers, body, bchWallet, x402Payer, isCh
         method,
         headers,
         body: ['POST', 'PUT', 'PATCH'].includes(method) ? body : undefined,
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(PAY_TIMEOUT_MS),
       });
     } catch (e) {
       if (e.name === 'AbortError') {

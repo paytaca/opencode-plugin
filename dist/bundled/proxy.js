@@ -141,22 +141,19 @@ function sseDone(res) {
   res.write('data: [DONE]\\n\\n');
 }
 
-// Build and stream SSE tier selection prompt
-async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'X-Payment-Required': 'true',
-    'Connection': 'keep-alive',
-  });
-
-  sseLine(res, {
-    id: 'tier-1',
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model: modelName,
-    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-  });
+// Stream the tier-selection prompt body (SSE lines) into an in-progress response.
+// When includeRole is false the leading role delta is skipped, so the body can be
+// appended to a stream that already emitted content (e.g. after a payment failure).
+async function streamTierSelectionBody(res, walletHash, modelName, tiers, includeRole) {
+  if (includeRole !== false) {
+    sseLine(res, {
+      id: 'tier-1',
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: modelName,
+      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+    });
+  }
 
   // Loading sequence
   sseLine(res, {
@@ -244,7 +241,19 @@ async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
+}
 
+// Build and stream a full tier-selection prompt (headers + body + [DONE]) to the client.
+async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
+  if (!res.headersSent) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Payment-Required': 'true',
+      'Connection': 'keep-alive',
+    });
+  }
+  await streamTierSelectionBody(res, walletHash, modelName, tiers, true);
   sseDone(res);
   res.end();
 }
@@ -536,8 +545,11 @@ function forceNonStreaming(body) {
 }
 
 // Convert a chat.completion JSON object to SSE format
-function jsonToSse(res, chatCompletion) {
-  const content = chatCompletion.choices?.[0]?.message?.content || '';
+function jsonToSse(res, chatCompletion, opts) {
+  opts = opts || {};
+  const message = chatCompletion.choices?.[0]?.message || {};
+  const content = message.content || '';
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : null;
   const model = chatCompletion.model || chatCompletion.model_id || 'deepseek/deepseek-v4-flash';
   const created = chatCompletion.created || Math.floor(Date.now() / 1000);
 
@@ -564,21 +576,58 @@ function jsonToSse(res, chatCompletion) {
   } catch (e) {
   }
 
+  const allContent = (opts.prependContent || '') + content;
   const chunkSize = 20;
   let chunksWritten = 0;
-  for (let i = 0; i < content.length; i += chunkSize) {
+  for (let i = 0; i < allContent.length; i += chunkSize) {
     try {
       sseLine(res, {
         id: 'chatcmpl-' + (i + 2),
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: { content: content.slice(i, i + chunkSize) }, finish_reason: null }],
+        choices: [{ index: 0, delta: { content: allContent.slice(i, i + chunkSize) }, finish_reason: null }],
       });
       chunksWritten++;
     } catch (e) {
       break;
     }
+  }
+
+  // Forward tool calls so tool-using responses (common in coding sessions) are
+  // preserved after the non-streaming paytaca-pay round-trip. Previously these
+  // were silently dropped, which produced an empty assistant message in OpenCode.
+  let finishReason = 'stop';
+  if (toolCalls && toolCalls.length > 0) {
+    const toolCallDeltas = [];
+    for (let i = 0; i < toolCalls.length; i++) {
+      const tc = toolCalls[i] || {};
+      const fn = tc.function || {};
+      let args = fn.arguments;
+      if (args !== undefined && typeof args !== 'string') {
+        try { args = JSON.stringify(args); } catch (e) { args = String(args); }
+      }
+      toolCallDeltas.push({
+        index: i,
+        id: tc.id || ('call_' + i),
+        type: 'function',
+        function: {
+          name: fn.name || '',
+          arguments: args === undefined || args === null ? '' : String(args),
+        },
+      });
+    }
+    try {
+      sseLine(res, {
+        id: 'chatcmpl-tools',
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: { tool_calls: toolCallDeltas }, finish_reason: null }],
+      });
+    } catch (e) {
+    }
+    finishReason = 'tool_calls';
   }
 
   try {
@@ -587,7 +636,7 @@ function jsonToSse(res, chatCompletion) {
       object: 'chat.completion.chunk',
       created,
       model,
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
       usage: chatCompletion.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   } catch (e) {
@@ -601,6 +650,36 @@ function jsonToSse(res, chatCompletion) {
   try {
     res.end();
   } catch (e) {
+  }
+}
+
+// Stream a payment-failure message, then re-show the tier-selection prompt so the
+// user can retry the same or a different plan without sending another message.
+// The pending payment is restored to the tier-select step so the next tier pick is
+// handled by the proxy instead of being forwarded fresh to Django.
+async function streamPaymentFailureAndRetry(res, walletHash, pendingPayload, message) {
+  try {
+    sseLine(res, {
+      id: 'pay-err',
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: 'deepseek/deepseek-v4-flash',
+      choices: [{ index: 0, delta: { content: message }, finish_reason: 'stop' }],
+    });
+  } catch (e) {
+  }
+  pendingPayload.step = 'tier_select';
+  pendingPayload.durationMinutes = null;
+  pendingPayments.set(walletHash, pendingPayload);
+  try {
+    const tiers = Array.isArray(pendingPayload.tiers) ? pendingPayload.tiers : [];
+    if (tiers.length > 0) {
+      await streamTierSelectionBody(res, walletHash, pendingPayload.displayName || pendingPayload.modelId || 'AI Model', tiers, false);
+    }
+    sseDone(res);
+    res.end();
+  } catch (e) {
+    try { res.end(); } catch (e2) {}
   }
 }
 
@@ -1031,19 +1110,14 @@ const server = http.createServer(async (req, res) => {
               res.write(': keepalive\\n\\n');
             }, 2000);
 
-            runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
+            runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, async (err, responseJson) => {
               pendingPayments.delete(walletHash);
               clearInterval(keepalive);
 
               if (err) {
                 log('paytaca pay failed: ' + err.message);
                 if (res.headersSent) {
-                  try {
-                    sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
-                    sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-                    sseDone(res);
-                    res.end();
-                  } catch (e) {}
+                  await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, '\\n\\n❌ Payment failed: ' + err.message + '\\n\\n');
                 } else {
                   res.writeHead(500, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
@@ -1053,17 +1127,23 @@ const server = http.createServer(async (req, res) => {
               
               if (!responseJson.success) {
                 const isTimeout = responseJson.timeout;
-                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'credits\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
+                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'credits\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error') + '\\n\\n';
                 const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
                 const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
                 const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
                 if (res.headersSent) {
-                  try {
-                    sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
-                    sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-                    sseDone(res);
-                    res.end();
-                  } catch (e) {}
+                  if (isTimeout) {
+                    // Payment was already processed — do NOT re-prompt (would double-charge).
+                    // The next chat hits the active session.
+                    try {
+                      sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                      sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+                      sseDone(res);
+                      res.end();
+                    } catch (e) {}
+                  } else {
+                    await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, sseContent);
+                  }
                 } else {
                   res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
@@ -1082,7 +1162,7 @@ const server = http.createServer(async (req, res) => {
               
               if (wasStreaming) {
                 try {
-                  jsonToSse(res, chatCompletion);
+                  jsonToSse(res, chatCompletion, { prependContent: '\\n💳 Payment successful — generating your response...\\n\\n' });
                 } catch (e) {}
               } else {
                 try {
@@ -1175,7 +1255,7 @@ const server = http.createServer(async (req, res) => {
             
             if (wasStreaming) {
               try {
-                jsonToSse(res, chatCompletion);
+                jsonToSse(res, chatCompletion, { prependContent: '\\n💳 Payment successful — generating your response...\\n\\n' });
               } catch (e) {}
             } else {
               try {
