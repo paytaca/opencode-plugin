@@ -547,6 +547,10 @@ function forceNonStreaming(body) {
 // Convert a chat.completion JSON object to SSE format
 function jsonToSse(res, chatCompletion, opts) {
   opts = opts || {};
+  if (res.destroyed || res.writableEnded) {
+    log('jsonToSse: response already destroyed/ended, cannot send SSE');
+    return;
+  }
   const message = chatCompletion.choices?.[0]?.message || {};
   const content = message.content || '';
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : null;
@@ -561,6 +565,7 @@ function jsonToSse(res, chatCompletion, opts) {
         'Connection': 'keep-alive',
       });
     } catch (e) {
+      log('jsonToSse writeHead failed: ' + e.message);
       return;
     }
   }
@@ -574,6 +579,7 @@ function jsonToSse(res, chatCompletion, opts) {
       choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
     });
   } catch (e) {
+    log('jsonToSse: failed to write role delta: ' + e.message);
   }
 
   const allContent = (opts.prependContent || '') + content;
@@ -590,13 +596,11 @@ function jsonToSse(res, chatCompletion, opts) {
       });
       chunksWritten++;
     } catch (e) {
+      log('jsonToSse: failed to write content chunk ' + (i / chunkSize) + ': ' + e.message);
       break;
     }
   }
 
-  // Forward tool calls so tool-using responses (common in coding sessions) are
-  // preserved after the non-streaming paytaca-pay round-trip. Previously these
-  // were silently dropped, which produced an empty assistant message in OpenCode.
   let finishReason = 'stop';
   if (toolCalls && toolCalls.length > 0) {
     const toolCallDeltas = [];
@@ -626,6 +630,7 @@ function jsonToSse(res, chatCompletion, opts) {
         choices: [{ index: 0, delta: { tool_calls: toolCallDeltas }, finish_reason: null }],
       });
     } catch (e) {
+      log('jsonToSse: failed to write tool_calls: ' + e.message);
     }
     finishReason = 'tool_calls';
   }
@@ -640,16 +645,19 @@ function jsonToSse(res, chatCompletion, opts) {
       usage: chatCompletion.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   } catch (e) {
+    log('jsonToSse: failed to write final delta: ' + e.message);
   }
 
   try {
     sseDone(res);
   } catch (e) {
+    log('jsonToSse: failed to write [DONE]: ' + e.message);
   }
 
   try {
     res.end();
   } catch (e) {
+    log('jsonToSse: res.end() failed: ' + e.message);
   }
 }
 
@@ -744,7 +752,17 @@ function runPaytacaPay(djangoUrl, body, walletHash, extraHeaders, callback) {
         callback(new Error('Could not parse paytaca pay response: ' + err.message));
       }
     } else {
-      callback(new Error(stderr.trim() || 'paytaca pay wrapper exited with code ' + code));
+      // Try to extract error from stdout (wrapper writes JSON errors to stdout, not stderr)
+      let wrapperErr = stderr.trim();
+      if (!wrapperErr) {
+        try {
+          const parsed = JSON.parse(stdout.trim());
+          wrapperErr = parsed.error || 'Unknown error';
+        } catch {
+          wrapperErr = stdout.trim() || 'paytaca pay wrapper exited with code ' + code;
+        }
+      }
+      callback(new Error(wrapperErr));
     }
   });
 
@@ -1116,11 +1134,15 @@ const server = http.createServer(async (req, res) => {
 
               if (err) {
                 log('paytaca pay failed: ' + err.message);
-                if (res.headersSent) {
+                if (res.headersSent && !res.destroyed && !res.writableEnded) {
                   await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, '\\n\\n❌ Payment failed: ' + err.message + '\\n\\n');
+                } else if (!res.headersSent) {
+                  try {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+                  } catch (e) { log('Failed to send payment error response: ' + e.message); }
                 } else {
-                  res.writeHead(500, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+                  log('Cannot send payment failure — response already ended or destroyed');
                 }
                 return;
               }
@@ -1131,22 +1153,24 @@ const server = http.createServer(async (req, res) => {
                 const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
                 const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
                 const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
-                if (res.headersSent) {
+                if (res.headersSent && !res.destroyed && !res.writableEnded) {
                   if (isTimeout) {
-                    // Payment was already processed — do NOT re-prompt (would double-charge).
-                    // The next chat hits the active session.
                     try {
                       sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
                       sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
                       sseDone(res);
                       res.end();
-                    } catch (e) {}
+                    } catch (e) { log('Failed to send timeout error via SSE: ' + e.message); }
                   } else {
                     await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, sseContent);
                   }
+                } else if (!res.headersSent) {
+                  try {
+                    res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+                  } catch (e) { log('Failed to send payment error JSON: ' + e.message); }
                 } else {
-                  res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+                  log('Cannot send payment error — response already ended or destroyed');
                 }
                 return;
               }
@@ -1160,15 +1184,22 @@ const server = http.createServer(async (req, res) => {
               
               log('paytaca pay succeeded. Returning chat response.');
               
+              if (res.destroyed || res.writableEnded) {
+                log('Payment succeeded but response connection is gone — cannot deliver chat response');
+                return;
+              }
+
               if (wasStreaming) {
                 try {
                   jsonToSse(res, chatCompletion, { prependContent: '\\n💳 Payment successful — generating your response...\\n\\n' });
-                } catch (e) {}
+                } catch (e) { log('jsonToSse threw: ' + e.message); }
               } else {
                 try {
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  if (!res.headersSent) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                  }
                   res.end(JSON.stringify(chatCompletion));
-                } catch (e) {}
+                } catch (e) { log('Failed to send non-streaming response: ' + e.message); }
               }
             });
             return;
@@ -1210,16 +1241,20 @@ const server = http.createServer(async (req, res) => {
             clearInterval(keepalive);
             if (err) {
               log('paytaca pay failed: ' + err.message);
-              if (res.headersSent) {
+              if (res.headersSent && !res.destroyed && !res.writableEnded) {
                 try {
                   sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
                   sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
                   sseDone(res);
                   res.end();
-                } catch (e) {}
+                } catch (e) { log('Failed to send payment error via SSE: ' + e.message); }
+              } else if (!res.headersSent) {
+                try {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+                } catch (e) { log('Failed to send payment error JSON: ' + e.message); }
               } else {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
+                log('Cannot send payment failure — response already ended or destroyed');
               }
               return;
             }
@@ -1230,16 +1265,20 @@ const server = http.createServer(async (req, res) => {
               const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
               const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
               const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
-              if (res.headersSent) {
+              if (res.headersSent && !res.destroyed && !res.writableEnded) {
                 try {
                   sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
                   sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
                   sseDone(res);
                   res.end();
-                } catch (e) {}
+                } catch (e) { log('Failed to send error via SSE: ' + e.message); }
+              } else if (!res.headersSent) {
+                try {
+                  res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+                } catch (e) { log('Failed to send error JSON: ' + e.message); }
               } else {
-                res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
+                log('Cannot send payment error — response already ended or destroyed');
               }
               return;
             }
@@ -1252,16 +1291,23 @@ const server = http.createServer(async (req, res) => {
             } catch {}
             
             log('paytaca pay succeeded. Returning chat response.');
+
+            if (res.destroyed || res.writableEnded) {
+              log('Payment succeeded but response connection is gone — cannot deliver chat response');
+              return;
+            }
             
             if (wasStreaming) {
               try {
                 jsonToSse(res, chatCompletion, { prependContent: '\\n💳 Payment successful — generating your response...\\n\\n' });
-              } catch (e) {}
+              } catch (e) { log('jsonToSse threw: ' + e.message); }
             } else {
               try {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
+                if (!res.headersSent) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                }
                 res.end(JSON.stringify(chatCompletion));
-              } catch (e) {}
+              } catch (e) { log('Failed to send non-streaming response: ' + e.message); }
             }
           });
           return;
@@ -1475,7 +1521,7 @@ server.on('error', (err) => {
 
 server.listen(PROXY_PORT, () => {
   log('Paytaca AI Proxy running on http://localhost:' + PROXY_PORT);
-  log('Forwarding to Django at ' + BACKEND_URL);
+  log('Forwarding to ' + BACKEND_URL);
   log('Discovery: http://localhost:' + PROXY_PORT + '/v1/config');
   log('Managed by OpenCode plugin');
 });
