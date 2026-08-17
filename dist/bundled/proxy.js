@@ -218,16 +218,24 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
     choices: [{ index: 0, delta: { content: '💳 Select a plan for **' + (modelName || 'AI Model') + '**\\n\\n' }, finish_reason: null }],
   });
 
+  // Build all tier lines into one string so backtick markdown renders
+  // consistently (same as the 'plans' command).
+  let tiersContent = '';
   for (let i = 0; i < tiers.length; i++) {
     const tier = tiers[i];
     const bchAmount = (tier.price_sats / 100000000).toFixed(8);
     const label = '\`(' + String(i + 1) + ')\`  ';
-    sseLine(res, {
-      id: 'tier-10-' + i,
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: label + tier.minutes + ' minutes — PHP ' + tier.price_php.toFixed(2) + ' (' + bchAmount + ' BCH)\\n' }, finish_reason: null }],
-    });
+    // Display USD price if available, fall back to PHP for legacy backends
+    const priceDisplay = tier.price_usd !== undefined && tier.price_usd !== null
+      ? 'USD ' + tier.price_usd.toFixed(4)
+      : 'PHP ' + (tier.price_php ? tier.price_php.toFixed(2) : '?.??');
+    tiersContent += label + tier.minutes + ' minutes — ' + priceDisplay + ' (' + bchAmount + ' BCH)\\n';
   }
+  sseLine(res, {
+    id: 'tier-10',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { content: tiersContent }, finish_reason: null }],
+  });
 
   sseLine(res, {
     id: 'tier-11',
@@ -908,8 +916,8 @@ async function handlePricingCommand(res) {
         sorted.forEach((t, i) => {
           const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
           const bch = (sats / 100000000).toFixed(8);
-          const php = typeof t.price_php === 'number' ? t.price_php.toFixed(2) : '?.??';
-          lines.push('  \`(' + String(i + 1) + ')\`  ' + (t.minutes || 0) + ' minutes — PHP ' + php + ' (' + bch + ' BCH)');
+          const usd = typeof t.price_usd === 'number' ? t.price_usd.toFixed(4) : '?.??';
+          lines.push('  \`(' + String(i + 1) + ')\`  ' + (t.minutes || 0) + ' minutes — USD ' + usd + ' (' + bch + ' BCH)');
         });
       }
     }
