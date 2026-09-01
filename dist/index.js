@@ -35,6 +35,8 @@ var __importStar = (this && this.__importStar) || (function () {
 const config_1 = require("./config");
 const wallet_1 = require("./wallet");
 const proxy_1 = require("./proxy");
+const mcp_1 = require("./bundled/mcp");
+const context_1 = require("./context");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const os = __importStar(require("os"));
@@ -112,6 +114,17 @@ async function OpencodePlugin(_input, _options) {
     }
     // Start or reuse proxy
     const proxy = await (0, proxy_1.startProxy)(configDir, config);
+    // Write the MCP server script so opencode can spawn it (registered in the
+    // config hook below). It exposes read-only account tools (credits, balance,
+    // models, plans) so the assistant can answer account questions directly.
+    const mcpScript = (0, config_1.getMcpScript)(configDir);
+    try {
+        fs.writeFileSync(mcpScript, mcp_1.MCP_SERVER_CONTENT, 'utf8');
+        fs.chmodSync(mcpScript, '755');
+    }
+    catch (e) {
+        console.error('Failed to write MCP server script:', e.message);
+    }
     // Auto-install paytaca-wallet skill globally (copy from paytaca-cli dependency)
     try {
         const skillCandidates = [
@@ -197,6 +210,20 @@ async function OpencodePlugin(_input, _options) {
                     'X-Wallet-Hash': cachedWalletHash,
                 };
             }
+            // Register the local MCP server so the assistant can answer questions
+            // about credits, balance, models, and plans with real account data.
+            // opencode spawns it automatically and loads its tools into the session.
+            cfg.mcp = cfg.mcp || {};
+            cfg.mcp['paytaca'] = {
+                type: 'local',
+                command: ['node', mcpScript],
+                environment: {
+                    PAYTACA_CONFIG_DIR: configDir,
+                    PAYTACA_CMD: (0, proxy_1.getPaytacaCommand)(),
+                    PAYTACA_BACKEND_URL: config.backendUrl || '',
+                },
+                enabled: true,
+            };
         },
         "chat.headers": async (_input, output) => {
             // Secondary fallback delivery path. Never send an empty value —
@@ -225,6 +252,23 @@ async function OpencodePlugin(_input, _options) {
             }
             catch (e) {
                 // Leave headers untouched — the proxy will surface the missing header.
+            }
+        },
+        "experimental.chat.messages.transform": async (_input, output) => {
+            // Keep proxy/payment chatter (tier prompts, credits/plans output,
+            // payment notices and their selection replies) out of the context sent
+            // to the LLM. The messages remain in the session UI for the user.
+            try {
+                if (output && Array.isArray(output.messages) && output.messages.length > 0) {
+                    const filtered = (0, context_1.filterProxyChatter)(output.messages);
+                    output.messages.length = 0;
+                    for (const m of filtered) {
+                        output.messages.push(m);
+                    }
+                }
+            }
+            catch (e) {
+                console.error('Failed to filter proxy chatter from context:', e.message);
             }
         },
     };

@@ -79,3 +79,7 @@ export function getLogFile(configDir: string): string {
 export function getWrapperScript(configDir: string): string {
   return path.join(configDir, 'paytaca-pay-wrapper.mjs');
 }
+
+export function getMcpScript(configDir: string): string {
+  return path.join(configDir, 'mcp-server.js');
+}

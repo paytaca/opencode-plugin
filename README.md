@@ -34,6 +34,34 @@ Once installed and configured in your OpenCode settings, the plugin automaticall
 - Creates a wallet on first run (recovery phrase is printed — save it securely)
 - Starts a local proxy that manages x402 payment flows transparently
 - Provides the `paytaca-ai` provider with the `deepseek/deepseek-v4-flash` model
+- Registers a local MCP server (`paytaca`) whose tools let the assistant answer account questions with real data — credits, wallet balance, available models, and plan pricing
+
+### Asking about your account
+
+Because the MCP server is loaded automatically, you can ask in plain language:
+
+- "How many credits do I have left?"
+- "What models are available?"
+- "How much does DeepSeek V4 Pro cost?"
+- "What's my wallet balance?"
+
+The assistant answers using live data from the Paytaca backend via these tools:
+
+| Tool | Description |
+|---|---|
+| `get_credits` | Remaining time credits per active model session |
+| `get_balance` | BCH balance of the Paytaca wallet |
+| `get_models` | Available models (id, display name, tier) |
+| `get_plans` | Plan pricing grouped by tier (minutes, USD, BCH) |
+
+### Proxy chatter never reaches the model
+
+Payment prompts, tier-selection menus, credits output, and payment notices
+produced by the proxy stay visible in your session for you — but they are
+stripped from the context sent to the LLM, so coding conversations are not
+polluted by payment flow messages. Your replies in those flows (e.g. picking
+a plan tier) are also excluded, while all genuine coding messages pass
+through untouched.
 
 ### Wallet management
 

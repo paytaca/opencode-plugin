@@ -1,4 +1,5 @@
 import { Config, ProxyInfo } from './types';
+export declare function getPaytacaCommand(): string;
 export declare function isPortAvailable(port: number): Promise<boolean>;
 export declare function findAvailablePort(startPort?: number, endPort?: number): Promise<number>;
 export declare function isProcessRunning(pid: number): boolean;

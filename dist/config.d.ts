@@ -10,4 +10,5 @@ export declare function getPidFile(configDir: string): string;
 export declare function getProxyScript(configDir: string): string;
 export declare function getLogFile(configDir: string): string;
 export declare function getWrapperScript(configDir: string): string;
+export declare function getMcpScript(configDir: string): string;
 //# sourceMappingURL=config.d.ts.map

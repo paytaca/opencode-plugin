@@ -16,7 +16,7 @@ import {
 import { PROXY_SCRIPT_CONTENT } from './bundled/proxy';
 import { WRAPPER_SCRIPT_CONTENT } from './bundled/wrapper';
 
-function getPaytacaCommand(): string {
+export function getPaytacaCommand(): string {
   try {
     const paytacaCliPkg = require.resolve('paytaca-cli/package.json');
     return path.resolve(path.dirname(paytacaCliPkg), 'bin', 'paytaca.js');

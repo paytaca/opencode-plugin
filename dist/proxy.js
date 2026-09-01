@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getPaytacaCommand = getPaytacaCommand;
 exports.isPortAvailable = isPortAvailable;
 exports.findAvailablePort = findAvailablePort;
 exports.isProcessRunning = isProcessRunning;

@@ -43,6 +43,7 @@ exports.getPidFile = getPidFile;
 exports.getProxyScript = getProxyScript;
 exports.getLogFile = getLogFile;
 exports.getWrapperScript = getWrapperScript;
+exports.getMcpScript = getMcpScript;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 // Default production backend
@@ -110,5 +111,8 @@ function getLogFile(configDir) {
 }
 function getWrapperScript(configDir) {
     return path.join(configDir, 'paytaca-pay-wrapper.mjs');
+}
+function getMcpScript(configDir) {
+    return path.join(configDir, 'mcp-server.js');
 }
 //# sourceMappingURL=config.js.map

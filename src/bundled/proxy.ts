@@ -139,6 +139,13 @@ function sseDone(res) {
   res.write('data: [DONE]\\n\\n');
 }
 
+// Zero-width marker prepended to every synthetic proxy message (tier
+// prompts, credits/plans output, payment notices). The opencode plugin
+// strips marker-carrying assistant messages from LLM context — proxy chatter
+// is not relevant to the coding session — while the user still sees them in
+// the UI (zero-width characters don't render).
+const PROXY_MARKER = String.fromCharCode(0x200b, 0x200b, 0x200b, 0x200b);
+
 // Stream the tier-selection prompt body (SSE lines) into an in-progress response.
 // When includeRole is false the leading role delta is skipped, so the body can be
 // appended to a stream that already emitted content (e.g. after a payment failure).
@@ -157,7 +164,7 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
   sseLine(res, {
     id: 'tier-2',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '⏳ Initializing Paytaca AI provider...\\n' }, finish_reason: null }],
+    choices: [{ index: 0, delta: { content: PROXY_MARKER + '⏳ Initializing Paytaca AI provider...\\n' }, finish_reason: null }],
   });
 
   const hasCli = await checkPaytacaCli();
@@ -286,7 +293,7 @@ async function streamLowBalanceNotice(res, modelName) {
   sseLine(res, {
     id: 'lb-2',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '⚠️ OpenRouter balance is low — please top up before continuing.\\n' }, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: { content: PROXY_MARKER + '⚠️ OpenRouter balance is low — please top up before continuing.\\n' }, finish_reason: 'stop' }],
   });
 
   sseLine(res, {
@@ -678,7 +685,7 @@ async function streamPaymentFailureAndRetry(res, walletHash, pendingPayload, mes
       object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
       model: 'deepseek/deepseek-v4-flash',
-      choices: [{ index: 0, delta: { content: message }, finish_reason: 'stop' }],
+      choices: [{ index: 0, delta: { content: PROXY_MARKER + message }, finish_reason: 'stop' }],
     });
   } catch (e) {
   }
@@ -857,7 +864,7 @@ async function handleTimeCreditsCommand(res, walletHash) {
   sseLine(res, {
     id: 'time-2',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: { content: PROXY_MARKER + content + '\\n' }, finish_reason: 'stop' }],
   });
   sseLine(res, {
     id: 'time-3',
@@ -939,7 +946,7 @@ async function handlePricingCommand(res) {
   sseLine(res, {
     id: 'price-2',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: content + '\\n' }, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: { content: PROXY_MARKER + content + '\\n' }, finish_reason: 'stop' }],
   });
   sseLine(res, {
     id: 'price-3',
@@ -1108,7 +1115,7 @@ const server = http.createServer(async (req, res) => {
               sseLine(res, {
                 id: 'balance-err',
                 object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: '\\n\\n❌ **Insufficient balance** — You have **' + (currentBalanceSats / 100000000).toFixed(8) + ' BCH** but need **' + (selectedTier.price_sats / 100000000).toFixed(8) + ' BCH** for this plan. Top up at least **' + neededBch.toFixed(8) + ' BCH** more.' + neededLine + '\\n\\nType \\\`balance\\\` to re-check or try a different plan:' }, finish_reason: 'stop' }],
+                choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ **Insufficient balance** — You have **' + (currentBalanceSats / 100000000).toFixed(8) + ' BCH** but need **' + (selectedTier.price_sats / 100000000).toFixed(8) + ' BCH** for this plan. Top up at least **' + neededBch.toFixed(8) + ' BCH** more.' + neededLine + '\\n\\nType \\\`balance\\\` to re-check or try a different plan:' }, finish_reason: 'stop' }],
               });
               sseLine(res, {
                 id: 'balance-err-done',
@@ -1162,7 +1169,7 @@ const server = http.createServer(async (req, res) => {
                 if (res.headersSent && !res.destroyed && !res.writableEnded) {
                   if (isTimeout) {
                     try {
-                      sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                      sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: PROXY_MARKER + sseContent }, finish_reason: 'stop' }] });
                       sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
                       sseDone(res);
                       res.end();
@@ -1249,7 +1256,7 @@ const server = http.createServer(async (req, res) => {
               log('paytaca pay failed: ' + err.message);
               if (res.headersSent && !res.destroyed && !res.writableEnded) {
                 try {
-                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
+                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
                   sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
                   sseDone(res);
                   res.end();
@@ -1273,7 +1280,7 @@ const server = http.createServer(async (req, res) => {
               const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
               if (res.headersSent && !res.destroyed && !res.writableEnded) {
                 try {
-                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: sseContent }, finish_reason: 'stop' }] });
+                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: PROXY_MARKER + sseContent }, finish_reason: 'stop' }] });
                   sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
                   sseDone(res);
                   res.end();
@@ -1336,7 +1343,7 @@ const server = http.createServer(async (req, res) => {
               index: 0,
               message: {
                 role: 'assistant',
-                content: 'Payment declined. Chat cannot continue without funding.\\n\\n' + fundMsg,
+                content: PROXY_MARKER + 'Payment declined. Chat cannot continue without funding.\\n\\n' + fundMsg,
               },
               finish_reason: 'stop',
             }],
