@@ -50,6 +50,13 @@ function log(message) {
 // step: 'tier_select' (user must pick a tier) or 'approval' (yes/no)
 const pendingPayments = new Map();
 
+// Monotonic id per incoming request. A response may only clear the pending
+// payment created by its own request — concurrent requests from opencode share
+// the wallet hash, and a plain 200 finishing mid-payment must not clobber the
+// pending entry another request just created (that made tier selections
+// "2"/"3" fall through to a fresh 402 and re-show the prompt forever).
+let requestCounter = 0;
+
 // Utility: run shell command and return output
 function runCommand(cmd, args = []) {
   return new Promise((resolve, reject) => {
@@ -1021,6 +1028,7 @@ const server = http.createServer(async (req, res) => {
   req.on('end', async () => {
     try {
       const walletHash = req.headers['x-wallet-hash'];
+      const proxyReqId = ++requestCounter;
       const lastContent = getLastUserMessageContent(body);
       
       log('Request received: wallet=' + (walletHash?.substring(0, 16) || 'none') + '..., bodyLen=' + body.length + ', pending=' + pendingPayments.has(walletHash));
@@ -1419,6 +1427,7 @@ const server = http.createServer(async (req, res) => {
           }
           
           pendingPayments.set(walletHash, {
+            reqId: proxyReqId,
             body: body,
             modelId: modelId,
             displayName: displayName,
@@ -1497,12 +1506,18 @@ const server = http.createServer(async (req, res) => {
         } else {
           if (res.headersSent) {
             log('Streaming response completed and already sent');
-            pendingPayments.delete(walletHash);
+            const settled = pendingPayments.get(walletHash);
+            if (settled && settled.reqId === proxyReqId) {
+              pendingPayments.delete(walletHash);
+            }
             return;
           }
 
           log('Forwarding normal response to OpenCode: status=' + statusCode + ', bodyLen=' + responseBody.length);
-          pendingPayments.delete(walletHash);
+          const settled = pendingPayments.get(walletHash);
+          if (settled && settled.reqId === proxyReqId) {
+            pendingPayments.delete(walletHash);
+          }
           res.writeHead(statusCode, {
             'Content-Type': headers['content-type'] || 'application/json',
           });
