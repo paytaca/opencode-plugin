@@ -34,9 +34,9 @@ Once installed and configured in your OpenCode settings, the plugin automaticall
 - Creates a wallet on first run (recovery phrase is printed — save it securely)
 - Starts a local proxy that manages x402 payment flows transparently
 - Provides the `paytaca-ai` provider with the `deepseek/deepseek-v4-flash` model
-- Registers a local MCP server (`paytaca`) whose tools let the assistant answer account questions with real data — credits, wallet balance, available models, and plan pricing
+- Registers a local MCP server (`paytaca`) whose tools let the assistant work with real Paytaca data — AI account (credits, models, plan pricing) and wallet (balance, transactions, addresses, tokens, sending)
 
-### Asking about your account
+### Asking about your account and wallet
 
 Because the MCP server is loaded automatically, you can ask in plain language:
 
@@ -44,8 +44,10 @@ Because the MCP server is loaded automatically, you can ask in plain language:
 - "What models are available?"
 - "How much does DeepSeek V4 Pro cost?"
 - "What's my wallet balance?"
+- "Show my latest transactions"
+- "What's my receiving address?"
 
-The assistant answers using live data from the Paytaca backend via these tools:
+The assistant answers using live data via these tools:
 
 | Tool | Description |
 |---|---|
@@ -53,6 +55,18 @@ The assistant answers using live data from the Paytaca backend via these tools:
 | `get_balance` | BCH balance of the Paytaca wallet |
 | `get_models` | Available models (id, display name, tier) |
 | `get_plans` | Plan pricing grouped by tier (minutes, USD, BCH) |
+| `get_transactions` | Recent wallet transactions (filter by direction, page) |
+| `get_receiving_address` | Receiving address, optionally as a BIP21 URI with amount |
+| `get_tokens` | CashToken holdings, or details for one token category |
+
+### Sending funds
+
+You can ask the assistant to send BCH or CashTokens ("send 0.01 BCH to
+bitcoincash:qp..."). Because that spends real funds, opencode will always
+prompt you for approval before the `send` tool executes — the plugin sets the
+`paytaca_send` permission to `ask` (an explicit choice in your own config is
+respected). Token amounts are in base units and recipients should use
+token-aware (z-prefix) addresses.
 
 ### Proxy chatter never reaches the model
 

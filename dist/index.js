@@ -224,6 +224,14 @@ async function OpencodePlugin(_input, _options) {
                 },
                 enabled: true,
             };
+            // The MCP send tool moves real funds — make opencode prompt the user
+            // before it runs (tool name is <server>_<tool> = 'paytaca_send'). A user
+            // configured choice is respected; only the unset default becomes 'ask'.
+            const permissions = (cfg.permission || {});
+            if (permissions['paytaca_send'] === undefined) {
+                permissions['paytaca_send'] = 'ask';
+            }
+            cfg.permission = permissions;
         },
         "chat.headers": async (_input, output) => {
             // Secondary fallback delivery path. Never send an empty value —

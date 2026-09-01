@@ -5,13 +5,18 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.MCP_SERVER_CONTENT = void 0;
 exports.MCP_SERVER_CONTENT = `#!/usr/bin/env node
 /**
- * Paytaca AI MCP Server
+ * Paytaca MCP Server
  *
- * Registers a small set of read-only tools (credits / balance / models / plans)
- * with opencode so the assistant can answer questions about the user's Paytaca
- * AI account instead of guessing. Loaded automatically via the plugin's
- * config hook (cfg.mcp['paytaca']).
+ * Registers Paytaca tools with opencode so the assistant can work with real
+ * data instead of guessing. Two groups:
+ * - Paytaca AI account (backend): credits, models, plan pricing
+ * - Paytaca wallet (paytaca CLI): balance, transactions, receiving address,
+ *   token holdings, and sending funds
  *
+ * The send tool moves real funds — opencode is configured (via the plugin's
+ * config hook) to require explicit user approval before it runs.
+ *
+ * Loaded automatically via the plugin's config hook (cfg.mcp['paytaca']).
  * Uses only Node.js built-in modules.
  */
 
@@ -92,7 +97,7 @@ function getJson(url, headers) {
 }
 
 // Run a shell command with a timeout
-function runCommand(cmd, args) {
+function runCommand(cmd, args, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { shell: false });
     let stdout = '';
@@ -103,7 +108,7 @@ function runCommand(cmd, args) {
       settled = true;
       try { child.kill(); } catch (e) {}
       reject(new Error('Command timed out'));
-    }, 15000);
+    }, timeoutMs || 15000);
     child.stdout.on('data', (d) => { stdout += d.toString(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('close', (code) => {
@@ -241,6 +246,66 @@ async function getPlans(filterModel) {
   return lines.join('\\n');
 }
 
+// Recent wallet transactions via the paytaca CLI
+async function getTransactions(args) {
+  const cmdArgs = ['history'];
+  if (args.type === 'incoming' || args.type === 'outgoing') {
+    cmdArgs.push('--type', args.type);
+  }
+  const page = parseInt(args.page, 10);
+  if (!isNaN(page) && page > 0) {
+    cmdArgs.push('--page', String(page));
+  }
+  const out = await runCommand(PAYTACA_CMD, cmdArgs, 30000);
+  return out || 'No transactions found.';
+}
+
+// Receiving address via the paytaca CLI (QR art suppressed)
+async function getReceivingAddress(args) {
+  const cmdArgs = ['receive', '--no-qr'];
+  const amount = parseFloat(args.amount);
+  if (!isNaN(amount) && amount > 0) {
+    cmdArgs.push('--amount', String(amount));
+  }
+  const out = await runCommand(PAYTACA_CMD, cmdArgs, 30000);
+  return out.trim() || 'Could not get receiving address.';
+}
+
+// CashToken holdings via the paytaca CLI (all tokens, or one category)
+async function getTokens(args) {
+  const category = args.category ? String(args.category).trim() : '';
+  const cmdArgs = category ? ['token', 'info', category] : ['token', 'list'];
+  const out = await runCommand(PAYTACA_CMD, cmdArgs, 30000);
+  return out.trim() || (category ? 'Token not found: ' + category : 'No tokens found.');
+}
+
+// Send BCH or CashTokens. This spends real funds — opencode requires manual
+// user approval for this tool (permission 'paytaca_send' set to 'ask' by the
+// plugin's config hook), so it must never be called without the user asking
+// for the send.
+async function sendFunds(args) {
+  const address = String(args.address || '').trim();
+  const amount = String(args.amount || '').trim();
+  const unit = args.unit === 'sats' ? 'sats' : 'bch';
+  const tokenCategory = args.token_category ? String(args.token_category).trim() : '';
+  if (!address) {
+    throw new Error('Missing recipient address.');
+  }
+  if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+    throw new Error('Missing or invalid amount.');
+  }
+  const cmdArgs = tokenCategory
+    ? ['token', 'send', address, amount, '--token', tokenCategory]
+    : ['send', address, amount];
+  if (!tokenCategory && unit === 'sats') {
+    cmdArgs.push('--unit', 'sats');
+  }
+  log('Send requested: ' + cmdArgs.join(' '));
+  const out = await runCommand(PAYTACA_CMD, cmdArgs, 90000);
+  log('Send completed');
+  return 'Transaction sent.\\n\\n' + out;
+}
+
 // Tool schemas (concise descriptions so MCP tool context stays small)
 const TOOLS = [
   {
@@ -268,6 +333,51 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'get_transactions',
+    description: 'Get recent Paytaca wallet transactions (sent/received BCH). Use when the user asks about transaction history or latest transactions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['incoming', 'outgoing'], description: 'Optional direction filter.' },
+        page: { type: 'number', description: 'Optional 1-based page number for older history.' },
+      },
+    },
+  },
+  {
+    name: 'get_receiving_address',
+    description: 'Get a Paytaca wallet receiving address for depositing BCH, optionally as a BIP21 URI with an amount. Use when the user wants to fund the wallet or needs their address.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        amount: { type: 'number', description: 'Optional BCH amount to embed in a BIP21 payment URI.' },
+      },
+    },
+  },
+  {
+    name: 'get_tokens',
+    description: 'List CashToken holdings of the Paytaca wallet, or get details (name, symbol, balance, NFTs) for one token category. Use when the user asks about tokens or NFTs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Optional token category id for details of a single token.' },
+      },
+    },
+  },
+  {
+    name: 'send',
+    description: 'Send BCH or CashTokens from the Paytaca wallet to an address. SPENDS REAL FUNDS — only call when the user explicitly asks to send; opencode will prompt the user for approval and that prompt must never be bypassed. Token amounts are in base units; recipients of tokens should use token-aware (z-prefix) addresses.',
+    inputSchema: {
+      type: 'object',
+      required: ['address', 'amount'],
+      properties: {
+        address: { type: 'string', description: 'Recipient CashAddr (e.g. bitcoincash:qp...).' },
+        amount: { type: 'string', description: 'Amount to send.' },
+        unit: { type: 'string', enum: ['bch', 'sats'], description: 'Amount unit, default bch. Ignored for token sends.' },
+        token_category: { type: 'string', description: 'Token category id to send CashTokens instead of BCH.' },
+      },
+    },
+  },
 ];
 
 // JSON-RPC over stdio (newline-delimited)
@@ -278,7 +388,7 @@ function handleMessage(msg) {
     send(msg.id, {
       protocolVersion: requestedVersion || PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'paytaca', version: '1.0.0' },
+      serverInfo: { name: 'paytaca', version: '1.1.0' },
     });
     return;
   }
@@ -305,6 +415,10 @@ function handleMessage(msg) {
           case 'get_balance': text = await getBalance(); break;
           case 'get_models': text = await getModels(); break;
           case 'get_plans': text = await getPlans(args.model); break;
+          case 'get_transactions': text = await getTransactions(args); break;
+          case 'get_receiving_address': text = await getReceivingAddress(args); break;
+          case 'get_tokens': text = await getTokens(args); break;
+          case 'send': text = await sendFunds(args); break;
           default: throw new Error('Unknown tool: ' + name);
         }
         send(msg.id, { content: [{ type: 'text', text: text }] });
