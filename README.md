@@ -77,6 +77,21 @@ polluted by payment flow messages. Your replies in those flows (e.g. picking
 a plan tier) are also excluded, while all genuine coding messages pass
 through untouched.
 
+### Automatic updates
+
+The plugin keeps itself installable and up to date without manual cleanup:
+
+- At startup it checks npm for a newer published version (5s timeout, fully
+  offline-safe). If one exists, it clears everything that would keep opencode
+  resolving the old one — semver-pinned dependency specs, stale lockfiles, and
+  stale plugin cache entries — so the next session or install picks it up.
+- Every install re-pins the dependency spec to the exact installed version
+  (avoids the `^0.x` semver trap that hides new releases) and removes
+  other-version cache entries.
+
+Set `PAYTACA_SELF_UPDATE=0` to disable the startup check. Activity is logged
+to `~/.opencode-paytaca/selfheal.log`.
+
 ### Wallet management
 
 A wallet is created automatically, but you can manage it manually:

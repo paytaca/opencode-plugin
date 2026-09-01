@@ -3,6 +3,7 @@ import { checkWallet, ensureWallet, checkPaytacaCli, ensurePaytacaOnPath } from 
 import { startProxy, getPaytacaCommand } from './proxy';
 import { MCP_SERVER_CONTENT } from './bundled/mcp';
 import { filterProxyChatter } from './context';
+import { runSelfHeal } from './selfheal';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -12,6 +13,10 @@ async function OpencodePlugin(_input?: any, _options?: any) {
   ensureConfigDir(configDir);
 
   let config = loadConfig(configDir);
+
+  // Best-effort: if a newer version is published, clear stale pins/caches so
+  // the next install or session picks it up. Never blocks startup.
+  void runSelfHeal();
 
   // Ensure paytaca binary is on PATH for internal use
   ensurePaytacaOnPath();

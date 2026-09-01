@@ -37,6 +37,7 @@ const wallet_1 = require("./wallet");
 const proxy_1 = require("./proxy");
 const mcp_1 = require("./bundled/mcp");
 const context_1 = require("./context");
+const selfheal_1 = require("./selfheal");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const os = __importStar(require("os"));
@@ -44,6 +45,9 @@ async function OpencodePlugin(_input, _options) {
     const configDir = (0, config_1.getConfigDir)();
     (0, config_1.ensureConfigDir)(configDir);
     let config = (0, config_1.loadConfig)(configDir);
+    // Best-effort: if a newer version is published, clear stale pins/caches so
+    // the next install or session picks it up. Never blocks startup.
+    void (0, selfheal_1.runSelfHeal)();
     // Ensure paytaca binary is on PATH for internal use
     (0, wallet_1.ensurePaytacaOnPath)();
     // Check if paytaca-cli is installed
