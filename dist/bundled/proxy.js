@@ -50,6 +50,10 @@ function log(message) {
 // step: 'tier_select' (user must pick a tier) or 'approval' (yes/no)
 const pendingPayments = new Map();
 
+// Track the last model used per wallet so we can detect model switches and
+// make sure a switched-to model never hits a stale payment prompt.
+const lastModelPerWallet = new Map();
+
 // Monotonic id per incoming request. A response may only clear the pending
 // payment created by its own request — concurrent requests from opencode share
 // the wallet hash, and a plain 200 finishing mid-payment must not clobber the
@@ -158,7 +162,7 @@ const PROXY_MARKER = String.fromCharCode(0x200b, 0x200b, 0x200b, 0x200b);
 // Stream the tier-selection prompt body (SSE lines) into an in-progress response.
 // When includeRole is false the leading role delta is skipped, so the body can be
 // appended to a stream that already emitted content (e.g. after a payment failure).
-async function streamTierSelectionBody(res, walletHash, modelName, tiers, includeRole) {
+async function streamTierSelectionBody(res, walletHash, modelName, tiers, includeRole, otherModels) {
   if (includeRole !== false) {
     sseLine(res, {
       id: 'tier-1',
@@ -232,6 +236,16 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
     choices: [{ index: 0, delta: { content: '💳 Select a plan for **' + (modelName || 'AI Model') + '**\\n\\n' }, finish_reason: null }],
   });
 
+  // If other models still have paid credits, tell the user they can switch
+  // instead of buying a new plan (only when there is something to suggest).
+  if (otherModels && otherModels.length > 0) {
+    sseLine(res, {
+      id: 'tier-9b',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: otherModelsHint(otherModels) }, finish_reason: null }],
+    });
+  }
+
   // Build all tier lines into one string so backtick markdown renders
   // consistently (same as the 'plans' command).
   let tiersContent = '';
@@ -266,7 +280,7 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
 }
 
 // Build and stream a full tier-selection prompt (headers + body + [DONE]) to the client.
-async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
+async function streamTierSelectionPrompt(res, walletHash, modelName, tiers, otherModels) {
   if (!res.headersSent) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -275,7 +289,7 @@ async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
       'Connection': 'keep-alive',
     });
   }
-  await streamTierSelectionBody(res, walletHash, modelName, tiers, true);
+  await streamTierSelectionBody(res, walletHash, modelName, tiers, true, otherModels);
   sseDone(res);
   res.end();
 }
@@ -283,7 +297,7 @@ async function streamTierSelectionPrompt(res, walletHash, modelName, tiers) {
 // Build and stream SSE loading sequence + payment prompt
 // Stream SSE notice when the upstream (OpenRouter) account lacks balance to fund
 // the request. Replaces the old single-tier yes/no approval prompt.
-async function streamLowBalanceNotice(res, modelName) {
+async function streamLowBalanceNotice(res, modelName, otherModels) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -299,10 +313,13 @@ async function streamLowBalanceNotice(res, modelName) {
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
   });
 
+  // Include the other-models hint (when available) so the user knows they can
+  // switch to a model that still has credits instead of being stuck.
+  const hint = otherModelsHint(otherModels);
   sseLine(res, {
     id: 'lb-2',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: PROXY_MARKER + '⚠️ OpenRouter balance is low — please top up before continuing.\\n' }, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: { content: PROXY_MARKER + '⚠️ OpenRouter balance is low — please top up before continuing.\\n' + hint }, finish_reason: 'stop' }],
   });
 
   sseLine(res, {
@@ -829,6 +846,58 @@ function getLastUserMessageContent(body) {
   }
 }
 
+// Fetch wallet status and return other models that still have remaining time
+// credits, excluding the model currently being requested. Returns an array of
+// { modelId, displayName, remainingSeconds } or [] when nothing qualifies
+// (or the status endpoint is unreachable). This powers the "you can switch to
+// another model" hint on 402 responses.
+async function getOtherModelsWithCredits(walletHash, excludeModelId) {
+  try {
+    const statusRes = await fetch(BACKEND_URL + '/v1/wallet/status', {
+      headers: { 'X-Wallet-Hash': walletHash }
+    });
+    if (!statusRes.ok) {
+      return [];
+    }
+    const statusData = await statusRes.json();
+    const sessions = Array.isArray(statusData.sessions) ? statusData.sessions : [];
+    const others = [];
+    for (const s of sessions) {
+      const modelId = s.ai_model || s.model_id || '';
+      if (excludeModelId && modelId && modelId === excludeModelId) {
+        continue;
+      }
+      const remaining = Number(s.time_remaining_seconds) || 0;
+      if (remaining > 0) {
+        others.push({
+          modelId: modelId,
+          displayName: s.display_name || modelId || 'Unknown model',
+          remainingSeconds: remaining,
+        });
+      }
+    }
+    return others;
+  } catch (err) {
+    log('Failed to check other models with credits: ' + err.message);
+    return [];
+  }
+}
+
+// Build a hint listing other models that still have remaining credits, so the
+// user knows they can switch instead of buying a new plan. Returns '' when
+// there is nothing worth suggesting.
+function otherModelsHint(otherModels) {
+  if (!otherModels || otherModels.length === 0) {
+    return '';
+  }
+  let hint = '\\n💡 You have remaining credits on other models:\\n';
+  for (const m of otherModels) {
+    hint += '   - **' + m.displayName + '** — ' + formatDuration(m.remainingSeconds) + ' remaining\\n';
+  }
+  hint += 'Switch to one of these models to keep chatting without a new purchase.\\n\\n';
+  return hint;
+}
+
 async function handleTimeCreditsCommand(res, walletHash) {
   log('Time command for wallet ' + walletHash?.substring(0, 16) + '...');
   const statusUrl = BACKEND_URL + '/v1/wallet/status';
@@ -1055,18 +1124,34 @@ const server = http.createServer(async (req, res) => {
       
       // Check if there's a pending payment for this wallet
       var pendingPayload = pendingPayments.get(walletHash);
+
+      // Parse the model requested by this call — used for switch detection
+      // and for clearing stale pending payments tied to a previous model.
+      var reqModel = '';
+      try { reqModel = JSON.parse(body).model || ''; } catch (e) {}
       
       // If there's a pending payment for a different model, clear it so the
       // new request can be forwarded fresh to Django.  This prevents the
       // proxy from re-showing a stale payment prompt when the user switches
       // to a different model mid-conversation.
       if (pendingPayload) {
-        var reqModel = '';
-        try { reqModel = JSON.parse(body).model || ''; } catch (e) {}
         if (reqModel && pendingPayload.modelId && reqModel !== pendingPayload.modelId) {
           pendingPayments.delete(walletHash);
           pendingPayload = null;
         }
+      }
+
+      // Model-switch detection: remember which model this wallet last used.
+      // When a switch is detected, log it — opencode carries the full
+      // conversation history on the next message, so the last prompt is
+      // effectively re-sent to the new model. If that model has no credits,
+      // the standard 402 flow shows the buy-plan prompt for it.
+      const prevModel = lastModelPerWallet.get(walletHash) || '';
+      if (reqModel && prevModel && reqModel !== prevModel) {
+        log('Model switch detected for wallet ' + (walletHash?.substring(0, 16) || 'none') + ': ' + prevModel + ' -> ' + reqModel);
+      }
+      if (reqModel) {
+        lastModelPerWallet.set(walletHash, reqModel);
       }
       
       if (pendingPayload) {
@@ -1437,8 +1522,11 @@ const server = http.createServer(async (req, res) => {
           });
           
           if (tiers && tiers.length > 0) {
-            // New flow: show tier selection prompt
-            await streamTierSelectionPrompt(res, walletHash, displayName || modelId || 'AI Model', tiers);
+            // New flow: show tier selection prompt. Also tell the user about
+            // other models that still have paid credits, so they can switch
+            // instead of buying a plan for the currently selected model.
+            const otherModels = await getOtherModelsWithCredits(walletHash, modelId || requestModel);
+            await streamTierSelectionPrompt(res, walletHash, displayName || modelId || 'AI Model', tiers, otherModels);
             return;
           }
           
@@ -1502,7 +1590,8 @@ const server = http.createServer(async (req, res) => {
             + ' tokensUsed=' + tokensUsed
             + ' tokenLimit=' + tokenLimit);
           
-          await streamLowBalanceNotice(res, displayName || statusModelId || modelId || 'AI Model');
+          const lowBalanceOtherModels = await getOtherModelsWithCredits(walletHash, statusModelId || modelId);
+          await streamLowBalanceNotice(res, displayName || statusModelId || modelId || 'AI Model', lowBalanceOtherModels);
         } else {
           if (res.headersSent) {
             log('Streaming response completed and already sent');
