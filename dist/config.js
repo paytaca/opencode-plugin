@@ -45,14 +45,15 @@ exports.getLogFile = getLogFile;
 exports.getWrapperScript = getWrapperScript;
 exports.getMcpScript = getMcpScript;
 const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const path = __importStar(require("path"));
 // Default production backend
 exports.DEFAULT_BACKEND_URL = 'https://api.paytaca.ai';
 exports.DEFAULT_PROXY_PORT = 8001;
 // Config directory: ~/.opencode-paytaca/
 function getConfigDir() {
-    const home = process.env.HOME || process.env.USERPROFILE || '.';
-    return path.join(home, '.opencode-paytaca');
+    // os.homedir() resolves HOME/USERPROFILE correctly on all platforms.
+    return path.join(os.homedir(), '.opencode-paytaca');
 }
 function ensureConfigDir(configDir) {
     if (!fs.existsSync(configDir)) {

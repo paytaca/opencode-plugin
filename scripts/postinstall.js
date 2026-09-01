@@ -5,12 +5,14 @@ const os = require('os');
 const path = require('path');
 
 const log = (msg) => console.log(`[paytaca] ${msg}`);
+const IS_WIN = process.platform === 'win32';
 
 function which(cmd) {
   try {
-    const which = process.platform === 'win32' ? 'where' : 'which';
-    const out = execSync(`${which} ${cmd}`, { encoding: 'utf8' }).trim().split('\n')[0];
-    return out || null;
+    // 'where' on Windows may return CRLF-separated matches; take the first.
+    const w = IS_WIN ? 'where' : 'which';
+    const out = execSync(`${w} ${cmd}`, { encoding: 'utf8' }).trim();
+    return out ? out.split(/\r?\n/)[0].trim() : null;
   } catch {
     return null;
   }
@@ -37,9 +39,9 @@ function resolveLocalCliBin() {
 function globalBinDir() {
   try {
     const prefix = execSync('npm prefix -g', { encoding: 'utf8' }).trim();
-    if (prefix) return path.join(prefix, process.platform === 'win32' ? '' : 'bin');
+    if (prefix) return IS_WIN ? prefix : path.join(prefix, 'bin');
   } catch {}
-  if (process.platform === 'win32') return null;
+  if (IS_WIN) return null;
   const homeBin = path.join(os.homedir(), '.npm-global', 'bin');
   if (fs.existsSync(homeBin)) return homeBin;
   const nvmBin = process.env.NVM_BIN;
@@ -57,6 +59,22 @@ function asdfReshim() {
 }
 
 const PACKAGE_NAME = '@paytaca/opencode-plugin';
+
+const norm = (p) => path.resolve(p);
+// `win` allows tests to exercise Windows path semantics without touching
+// the real process.platform (which child_process.execSync reads to pick its
+// shell). Defaults to the running platform.
+function normKey(p, win) {
+  win = win === undefined ? IS_WIN : win;
+  const r = norm(p);
+  return win ? r.toLowerCase() : r;
+}
+// Is `child` the same as, or located beneath, `parent`?
+function isInside(child, parent, win) {
+  const c = normKey(child, win);
+  const p = normKey(parent, win);
+  return c === p || c.startsWith(p + path.sep);
+}
 
 // Clean up version-inconsistency traps after a fresh install:
 // 1. Remove opencode plugin-cache entries for other versions of this plugin.
@@ -78,9 +96,8 @@ function selfPin() {
       for (const entry of fs.readdirSync(cacheBase)) {
         if (entry.indexOf('opencode-plugin') === -1) continue;
         const dir = path.join(cacheBase, entry);
-        const resolved = path.resolve(dir);
-        const root = path.resolve(pkgRoot);
-        if (resolved === root || resolved.startsWith(root + path.sep)) continue;
+        // Paths are case-insensitive on Windows; compare normalized keys.
+        if (isInside(pkgRoot, dir)) continue;
         let version = null;
         try {
           version = JSON.parse(
@@ -93,16 +110,25 @@ function selfPin() {
       }
     } catch {}
 
-    // 2. Exact-pin the spec in every opencode scope referencing the plugin
+    // 2. Exact-pin the spec in every opencode scope referencing the plugin.
+    //    npm runs lifecycle scripts with cwd = the package install dir, so
+    //    consider both `<cwd>/.opencode` and `<cwd>` itself as project scopes.
     const cfgDir = path.join(
       process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
       'opencode'
     );
-    const configDirs = [cfgDir];
-    try {
-      const projectDir = path.join(process.cwd(), '.opencode');
-      if (fs.existsSync(path.join(projectDir, 'package.json'))) configDirs.push(projectDir);
-    } catch {}
+    const cwd = process.cwd();
+    const seen = new Set();
+    const configDirs = [];
+    for (const d of [cfgDir, path.join(cwd, '.opencode'), cwd]) {
+      if (isInside(d, pkgRoot)) continue;
+      const key = normKey(d);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try {
+        if (fs.existsSync(path.join(d, 'package.json'))) configDirs.push(d);
+      } catch {}
+    }
     for (const dir of configDirs) {
       try {
         const file = path.join(dir, 'package.json');
@@ -132,10 +158,29 @@ function selfPin() {
   } catch {}
 }
 
-async function linkGlobally(cliBin) {
-  const binDir = globalBinDir();
+// `opts.platform`/`opts.binDir` let tests drive the Windows/unix branches
+// deterministically; in production they default to the running platform and a
+// resolved global bin directory.
+async function linkGlobally(cliBin, opts) {
+  opts = opts || {};
+  const win = opts.platform ? opts.platform === 'win32' : IS_WIN;
+  const binDir = opts.binDir || globalBinDir();
   if (!binDir) throw new Error('Could not determine global bin directory');
   fs.mkdirSync(binDir, { recursive: true });
+
+  if (win) {
+    // Windows can't run shebang'd .js files, and symlinking requires admin /
+    // Developer Mode. Ship a .cmd shim (used by cmd.exe and PowerShell) plus a
+    // POSIX-style wrapper so Git-Bash / MSYS users get a working `paytaca` too.
+    const cmdFile = path.join(binDir, 'paytaca.cmd');
+    fs.writeFileSync(cmdFile, '@echo off\r\nnode "' + cliBin + '" %*\r\n', 'utf8');
+    try {
+      const shFile = path.join(binDir, 'paytaca');
+      fs.writeFileSync(shFile, '#!/bin/sh\nexec node "' + cliBin + '" "$@"\n', 'utf8');
+      fs.chmodSync(shFile, '755');
+    } catch {}
+    return cmdFile;
+  }
 
   const link = path.join(binDir, 'paytaca');
   if (fs.existsSync(link) || fs.lstatSync(link, { throwIfNoEntry: false })) {
@@ -163,7 +208,7 @@ async function main() {
     const link = await linkGlobally(cliBin);
     log(`Linked paytaca -> ${link}`);
   } catch (err) {
-    log(`Could not symlink paytaca globally (${err.message}).`);
+    log(`Could not link paytaca globally (${err.message}).`);
     log('Falling back to: npm install -g paytaca-cli');
     try {
       execSync('npm install -g paytaca-cli', { stdio: 'inherit' });
@@ -174,4 +219,21 @@ async function main() {
   }
 }
 
-main().catch(() => {});
+// Export helpers for tests. When run as a script (npm postinstall), main()
+// executes; when required by a test, only the functions are exposed.
+if (require.main === module) {
+  main().catch(() => {});
+}
+
+module.exports = {
+  which,
+  runPaytacaVersion,
+  resolveLocalCliBin,
+  globalBinDir,
+  asdfReshim,
+  selfPin,
+  linkGlobally,
+  isInside,
+  normKey,
+  IS_WIN,
+};

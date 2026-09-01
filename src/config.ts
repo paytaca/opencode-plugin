@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Config } from './types';
 
@@ -8,8 +9,8 @@ export const DEFAULT_PROXY_PORT = 8001;
 
 // Config directory: ~/.opencode-paytaca/
 export function getConfigDir(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || '.';
-  return path.join(home, '.opencode-paytaca');
+  // os.homedir() resolves HOME/USERPROFILE correctly on all platforms.
+  return path.join(os.homedir(), '.opencode-paytaca');
 }
 
 export function ensureConfigDir(configDir: string): void {
