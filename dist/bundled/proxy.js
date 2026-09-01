@@ -236,16 +236,6 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
     choices: [{ index: 0, delta: { content: '💳 Select a plan for **' + (modelName || 'AI Model') + '**\\n\\n' }, finish_reason: null }],
   });
 
-  // If other models still have paid credits, tell the user they can switch
-  // instead of buying a new plan (only when there is something to suggest).
-  if (otherModels && otherModels.length > 0) {
-    sseLine(res, {
-      id: 'tier-9b',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: otherModelsHint(otherModels) }, finish_reason: null }],
-    });
-  }
-
   // Build all tier lines into one string so backtick markdown renders
   // consistently (same as the 'plans' command).
   let tiersContent = '';
@@ -268,8 +258,18 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
   sseLine(res, {
     id: 'tier-11',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + '), e.g. type ' + tiers[0].minutes + ':' }, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + '), e.g. type ' + tiers[0].minutes + ':\\n' }, finish_reason: 'stop' }],
   });
+
+  // If other models still have paid credits, tell the user they can switch
+  // instead of buying a new plan (only when there is something to suggest).
+  if (otherModels && otherModels.length > 0) {
+    sseLine(res, {
+      id: 'tier-9b',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: otherModelsHint(otherModels) }, finish_reason: null }],
+    });
+  }
 
   sseLine(res, {
     id: 'tier-12',
