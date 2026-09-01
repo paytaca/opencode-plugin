@@ -246,6 +246,141 @@ async function getPlans(filterModel) {
   return lines.join('\\n');
 }
 
+// Resolve a model (by id or display name) and its price tier by minutes.
+// Uses the same /v1/config data as get_plans.
+async function resolvePlan(modelFilter, minutes) {
+  const data = await getJson(BACKEND_URL + '/v1/config', {});
+  const models = Array.isArray(data.models) ? data.models : [];
+  const f = String(modelFilter || '').toLowerCase();
+  const matches = models.filter((m) => {
+    const id = String(m.id || '').toLowerCase();
+    const name = String(m.display_name || '').toLowerCase();
+    return id.indexOf(f) !== -1 || name.indexOf(f) !== -1;
+  });
+  if (matches.length === 0) {
+    const ids = models.map((m) => m.id).join(', ');
+    throw new Error('Model not found: ' + modelFilter + '. Available models: ' + ids);
+  }
+  const model = matches[0];
+  const tiers = Array.isArray(model.price_tiers) ? model.price_tiers : [];
+  const want = Number(minutes);
+  const tier = tiers.find((t) => Number(t.minutes) === want);
+  if (!tier) {
+    const avail = tiers.map((t) => t.minutes).join(', ');
+    throw new Error('No ' + minutes + '-minute plan for ' + (model.display_name || model.id) + '. Available minutes: ' + avail);
+  }
+  return { model, tier };
+}
+
+// Wallet balance in sats (mirrors the proxy's pre-payment check)
+async function getBalanceSats() {
+  const out = await runCommand(PAYTACA_CMD, ['wallet', 'info'], 20000);
+  const match = out.match(/Balance:\\s*([\\d.]+)\\s*BCH/i);
+  if (!match) return null;
+  return Math.floor(parseFloat(match[1]) * 100000000);
+}
+
+// Purchase time credits for a specific model and plan duration. Reuses the
+// same payment wrapper the proxy runs on a 402 (x402 payment + retry with the
+// PAYMENT-SIGNATURE header), but works for ANY model/tier the user picks —
+// not just the model active in the current session. Spends real BCH.
+async function buyPlan(args) {
+  const modelFilter = String(args.model || '').trim();
+  const minutes = Number(args.minutes);
+  if (!modelFilter) {
+    throw new Error('Missing model. Pass the model id or display name (e.g. deepseek/deepseek-v4-flash).');
+  }
+  if (isNaN(minutes) || minutes <= 0) {
+    throw new Error('Missing or invalid minutes. Pass the plan duration, e.g. 30 for the 30-minute plan.');
+  }
+
+  const { model, tier } = await resolvePlan(modelFilter, minutes);
+  const priceSats = Number(tier.price_sats) || 0;
+
+  // Fail fast on insufficient balance instead of sending a txn that cannot
+  // fund the plan (mirrors the proxy's 402 flow).
+  const balanceSats = await getBalanceSats();
+  if (balanceSats !== null && balanceSats < priceSats) {
+    const addr = await getReceivingAddress({});
+    const shortfall = (priceSats - balanceSats) / 100000000;
+    throw new Error('Insufficient balance: ' + (balanceSats / 100000000).toFixed(8) + ' BCH available but the ' + minutes + '-minute plan costs ' + (priceSats / 100000000).toFixed(8) + ' BCH. Top up at least ' + shortfall.toFixed(8) + ' BCH to: ' + addr);
+  }
+
+  const wrapper = path.join(CONFIG_DIR, 'paytaca-pay-wrapper.mjs');
+  if (!fs.existsSync(wrapper)) {
+    throw new Error('Payment wrapper not found at ' + wrapper + '. Restart opencode so the plugin writes it.');
+  }
+
+  // Minimal chat request for the target model; the payment flow only needs a
+  // valid request that triggers the x402 PaymentRequired for that model.
+  const body = JSON.stringify({
+    model: model.id,
+    messages: [{ role: 'user', content: 'Purchase plan' }],
+    stream: false,
+  });
+
+  const url = BACKEND_URL + '/v1/chat/completions?wallet_hash=' + encodeURIComponent(WALLET_HASH || '');
+  const extraHeaders = {
+    'X-Model-Id': model.id,
+    'X-Duration-Minutes': String(tier.minutes),
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'paytaca-buy-plan-'));
+  const bodyFile = path.join(tmpDir, 'body.json');
+  const configFile = path.join(tmpDir, 'config.json');
+  try {
+    fs.writeFileSync(bodyFile, body, 'utf8');
+    fs.writeFileSync(configFile, JSON.stringify({
+      url: url,
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, extraHeaders),
+      bodyFile: bodyFile,
+      confirmed: true,
+    }), 'utf8');
+  } catch (e) {
+    try { fs.rmdirSync(tmpDir); } catch (e2) {}
+    throw new Error('Failed to write payment files: ' + e.message);
+  }
+
+  log('Buy plan requested: ' + model.id + ' ' + tier.minutes + ' min');
+  let stdout;
+  try {
+    stdout = await runCommand('node', [wrapper, configFile], 250000);
+  } finally {
+    try { fs.unlinkSync(bodyFile); } catch (e2) {}
+    try { fs.unlinkSync(configFile); } catch (e2) {}
+    try { fs.rmdirSync(tmpDir); } catch (e2) {}
+  }
+
+  let result;
+  try {
+    result = JSON.parse(stdout);
+  } catch (e) {
+    throw new Error('Could not parse payment result: ' + stdout.substring(0, 200));
+  }
+
+  if (result.timeout) {
+    return 'Payment was processed but the response timed out. Check your credits with get_credits.';
+  }
+  if (!result.success) {
+    throw new Error(result.error || 'Payment failed (status ' + result.status + ').');
+  }
+
+  const lines = ['Plan purchased for ' + (model.display_name || model.id) + ': ' + tier.minutes + ' minutes.'];
+  if (result.payment && result.payment.txid) {
+    lines.push('Transaction: ' + result.payment.txid);
+  }
+  try {
+    const status = await getJson(BACKEND_URL + '/v1/wallet/status', { 'X-Wallet-Hash': WALLET_HASH });
+    const sessions = Array.isArray(status.sessions) ? status.sessions : [];
+    const found = sessions.find((s) => s.ai_model === model.id);
+    if (found && found.time_remaining_seconds > 0) {
+      lines.push('Credits: ' + formatDuration(found.time_remaining_seconds) + ' remaining.');
+    }
+  } catch (e) {}
+  return lines.join('\\n');
+}
+
 // Recent wallet transactions via the paytaca CLI
 async function getTransactions(args) {
   const cmdArgs = ['history'];
@@ -334,6 +469,18 @@ const TOOLS = [
     },
   },
   {
+    name: 'buy_plan',
+    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS BCH FROM THE WALLET — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session.',
+    inputSchema: {
+      type: 'object',
+      required: ['model', 'minutes'],
+      properties: {
+        model: { type: 'string', description: 'Model id or display name, e.g. deepseek/deepseek-v4-flash or DeepSeek V4 Flash.' },
+        minutes: { type: 'number', description: 'Plan duration in minutes, e.g. 30 for the 30-minute tier.' },
+      },
+    },
+  },
+  {
     name: 'get_transactions',
     description: 'Get recent Paytaca wallet transactions (sent/received BCH). Use when the user asks about transaction history or latest transactions.',
     inputSchema: {
@@ -388,7 +535,7 @@ function handleMessage(msg) {
     send(msg.id, {
       protocolVersion: requestedVersion || PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'paytaca', version: '1.1.0' },
+      serverInfo: { name: 'paytaca', version: '1.2.0' },
     });
     return;
   }
@@ -415,6 +562,7 @@ function handleMessage(msg) {
           case 'get_balance': text = await getBalance(); break;
           case 'get_models': text = await getModels(); break;
           case 'get_plans': text = await getPlans(args.model); break;
+          case 'buy_plan': text = await buyPlan(args); break;
           case 'get_transactions': text = await getTransactions(args); break;
           case 'get_receiving_address': text = await getReceivingAddress(args); break;
           case 'get_tokens': text = await getTokens(args); break;

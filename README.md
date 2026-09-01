@@ -55,9 +55,19 @@ The assistant answers using live data via these tools:
 | `get_balance` | BCH balance of the Paytaca wallet |
 | `get_models` | Available models (id, display name, tier) |
 | `get_plans` | Plan pricing grouped by tier (minutes, USD, BCH) |
+| `buy_plan` | Buy time credits for any model + plan duration (spends BCH) |
 | `get_transactions` | Recent wallet transactions (filter by direction, page) |
 | `get_receiving_address` | Receiving address, optionally as a BIP21 URI with amount |
 | `get_tokens` | CashToken holdings, or details for one token category |
+
+### Buying a plan
+
+You can ask the assistant to buy a plan for any model — even one not active in
+the current session ("buy the 30-minute DeepSeek V4 Flash plan"). The assistant
+shows pricing with `get_plans`, then purchases via `buy_plan`, which runs the
+same x402 payment flow as the interactive proxy prompt. Because this spends
+real funds, opencode always asks for approval before the tool runs (the plugin
+sets the `paytaca_buy_plan` permission to `ask`).
 
 ### Sending funds
 

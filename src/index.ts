@@ -208,12 +208,16 @@ async function OpencodePlugin(_input?: any, _options?: any) {
         enabled: true,
       };
 
-      // The MCP send tool moves real funds — make opencode prompt the user
-      // before it runs (tool name is <server>_<tool> = 'paytaca_send'). A user
-      // configured choice is respected; only the unset default becomes 'ask'.
+      // The MCP send and buy_plan tools move real funds — make opencode
+      // prompt the user before they run (tool names are <server>_<tool> =
+      // 'paytaca_send' / 'paytaca_buy_plan'). A user configured choice is
+      // respected; only unset defaults become 'ask'.
       const permissions = (cfg.permission || {}) as Record<string, unknown>;
       if (permissions['paytaca_send'] === undefined) {
         permissions['paytaca_send'] = 'ask';
+      }
+      if (permissions['paytaca_buy_plan'] === undefined) {
+        permissions['paytaca_buy_plan'] = 'ask';
       }
       cfg.permission = permissions as typeof cfg.permission;
     },
