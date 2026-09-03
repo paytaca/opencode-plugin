@@ -189,7 +189,7 @@ async function getModels() {
   return lines.join('\\n');
 }
 
-// Plan pricing grouped by tier, optionally filtered to one model
+// Plan pricing as a markdown table per model, optionally filtered to one model
 async function getPlans(filterModel) {
   const data = await getJson(BACKEND_URL + '/v1/config', {});
   let models = Array.isArray(data.models) ? data.models : [];
@@ -201,45 +201,32 @@ async function getPlans(filterModel) {
       return id.indexOf(f) !== -1 || name.indexOf(f) !== -1;
     });
   }
-  const groups = { budget: [], premium: [], frontier: [], other: [] };
+  if (models.length === 0) {
+    return 'No models available.';
+  }
+  const lines = [];
   for (const m of models) {
-    const key = String(m.tier || '').toLowerCase();
-    const groupKey = (key === 'budget' || key === 'premium' || key === 'frontier') ? key : 'other';
-    groups[groupKey].push(m);
-  }
-  const lines = ['Paytaca AI — Model Pricing'];
-  const order = [
-    { key: 'budget', label: 'Budget' },
-    { key: 'premium', label: 'Premium' },
-    { key: 'frontier', label: 'Frontier' },
-    { key: 'other', label: 'Other' },
-  ];
-  let any = false;
-  for (const g of order) {
-    const group = groups[g.key];
-    if (group.length === 0) continue;
-    any = true;
+    const name = m.display_name || m.id;
+    const tier = m.tier ? String(m.tier).charAt(0).toUpperCase() + String(m.tier).slice(1) : '';
+    const tierInName = tier && name.toLowerCase().indexOf(tier.toLowerCase()) !== -1;
+    if (lines.length > 0) lines.push('');
+    lines.push('**' + name + (tier && !tierInName ? ' (' + tier + ')' : '') + '**');
     lines.push('');
-    lines.push(g.label);
-    for (const m of group) {
-      lines.push('');
-      const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
-      if (tiers.length === 0) {
-        lines.push('- ' + (m.display_name || m.id) + ': no pricing configured');
-        continue;
-      }
-      const sorted = tiers.slice().sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
-      lines.push((m.display_name || m.id) + ':');
-      for (const t of sorted) {
-        const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
-        const bch = (sats / 100000000).toFixed(8);
-        const usd = typeof t.price_usd === 'number' ? t.price_usd.toFixed(4) : '?.??';
-        lines.push('  ' + (t.minutes || 0) + ' minutes — USD ' + usd + ' (' + bch + ' BCH)');
-      }
+    const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
+    if (tiers.length === 0) {
+      lines.push('No pricing configured.');
+      continue;
     }
-  }
-  if (!any) {
-    lines.push('No models available.');
+    lines.push('| Duration | USD | BCH | Sats |');
+    lines.push('|---|---|---|---|');
+    const sorted = tiers.slice().sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+    for (const t of sorted) {
+      const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
+      const bch = (sats / 100000000).toFixed(8);
+      const usd = typeof t.price_usd === 'number' ? '$' + t.price_usd.toFixed(2) : '?.??';
+      const satsStr = Number(sats).toLocaleString('en-US');
+      lines.push('| ' + (t.minutes || 0) + ' min | ' + usd + ' | ' + bch + ' | ' + satsStr + ' |');
+    }
   }
   return lines.join('\\n');
 }
