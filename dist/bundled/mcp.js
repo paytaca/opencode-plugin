@@ -31,6 +31,10 @@ const CONFIG_DIR = process.env.PAYTACA_CONFIG_DIR || path.join(os.homedir(), '.o
 const PAYTACA_CMD = process.env.PAYTACA_CMD || 'paytaca';
 const DEFAULT_BACKEND = process.env.PAYTACA_BACKEND_URL || 'https://api.paytaca.ai';
 
+// LIFT is the Paytaca token users can pay AI plans with (sold via Cauldron).
+// The same token id is used by the payment wrapper's payWithLift().
+const LIFT_TOKEN_ID = '5932b2fd4915d6a75d3ec53282cd49118149a2176ee67ed68b1111ff0786f7fc';
+
 const PROTOCOL_VERSION = '2025-06-18';
 
 // Logging setup
@@ -262,9 +266,18 @@ async function resolvePlan(modelFilter, minutes) {
 // Wallet balance in sats (mirrors the proxy's pre-payment check)
 async function getBalanceSats() {
   const out = await runCommand(PAYTACA_CMD, ['wallet', 'info'], 20000);
-  const match = out.match(/Balance:\\s*([\\d.]+)\\s*BCH/i);
+  const match = out.match(/Balance:\s*([\d.]+)\s*BCH/i);
   if (!match) return null;
   return Math.floor(parseFloat(match[1]) * 100000000);
+}
+
+// LIFT token balance in base units (2 decimals), null when the CLI output
+// cannot be parsed.
+async function getLiftBalanceUnits() {
+  const out = await runCommand(PAYTACA_CMD, ['token', 'info', LIFT_TOKEN_ID], 20000);
+  const match = out.match(/Balance:\s*([\d.]+)\s*LIFT/i);
+  if (!match) return null;
+  return BigInt(Math.round(parseFloat(match[1]) * 100));
 }
 
 // Purchase time credits for a specific model and plan duration. Reuses the
@@ -274,6 +287,7 @@ async function getBalanceSats() {
 async function buyPlan(args) {
   const modelFilter = String(args.model || '').trim();
   const minutes = Number(args.minutes);
+  const paymentMethod = args.payment_method === 'lift' ? 'lift' : 'bch';
   if (!modelFilter) {
     throw new Error('Missing model. Pass the model id or display name (e.g. deepseek/deepseek-v4-flash).');
   }
@@ -285,12 +299,22 @@ async function buyPlan(args) {
   const priceSats = Number(tier.price_sats) || 0;
 
   // Fail fast on insufficient balance instead of sending a txn that cannot
-  // fund the plan (mirrors the proxy's 402 flow).
-  const balanceSats = await getBalanceSats();
-  if (balanceSats !== null && balanceSats < priceSats) {
-    const addr = await getReceivingAddress({});
-    const shortfall = (priceSats - balanceSats) / 100000000;
-    throw new Error('Insufficient balance: ' + (balanceSats / 100000000).toFixed(8) + ' BCH available but the ' + minutes + '-minute plan costs ' + (priceSats / 100000000).toFixed(8) + ' BCH. Top up at least ' + shortfall.toFixed(8) + ' BCH to: ' + addr);
+  // fund the plan (mirrors the proxy's 402 flow). Only applies to BCH — the
+  // LIFT path funds the plan by selling tokens, so no BCH balance is required.
+  if (paymentMethod === 'bch') {
+    const balanceSats = await getBalanceSats();
+    if (balanceSats !== null && balanceSats < priceSats) {
+      const addr = await getReceivingAddress({});
+      const shortfall = (priceSats - balanceSats) / 100000000;
+      throw new Error('Insufficient balance: ' + (balanceSats / 100000000).toFixed(8) + ' BCH available but the ' + minutes + '-minute plan costs ' + (priceSats / 100000000).toFixed(8) + ' BCH. Top up at least ' + shortfall.toFixed(8) + ' BCH to: ' + addr);
+    }
+  } else {
+    // LIFT path: fail fast if the wallet holds no LIFT, instead of prompting
+    // for approval and then failing inside the wrapper.
+    const liftBalanceUnits = await getLiftBalanceUnits();
+    if (liftBalanceUnits !== null && liftBalanceUnits <= 0n) {
+      throw new Error('No LIFT tokens in the wallet. Add LIFT to pay this plan with tokens, or call again with payment_method "bch".');
+    }
   }
 
   const wrapper = path.join(CONFIG_DIR, 'paytaca-pay-wrapper.mjs');
@@ -317,19 +341,23 @@ async function buyPlan(args) {
   const configFile = path.join(tmpDir, 'config.json');
   try {
     fs.writeFileSync(bodyFile, body, 'utf8');
-    fs.writeFileSync(configFile, JSON.stringify({
+    const config = {
       url: url,
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, extraHeaders),
       bodyFile: bodyFile,
       confirmed: true,
-    }), 'utf8');
+    };
+    if (paymentMethod === 'lift') {
+      config.paymentMethod = 'lift';
+    }
+    fs.writeFileSync(configFile, JSON.stringify(config), 'utf8');
   } catch (e) {
     try { fs.rmdirSync(tmpDir); } catch (e2) {}
     throw new Error('Failed to write payment files: ' + e.message);
   }
 
-  log('Buy plan requested: ' + model.id + ' ' + tier.minutes + ' min');
+  log('Buy plan requested: ' + model.id + ' ' + tier.minutes + ' min (' + paymentMethod + ')');
   let stdout;
   try {
     stdout = await runCommand('node', [wrapper, configFile], 250000);
@@ -353,7 +381,7 @@ async function buyPlan(args) {
     throw new Error(result.error || 'Payment failed (status ' + result.status + ').');
   }
 
-  const lines = ['Plan purchased for ' + (model.display_name || model.id) + ': ' + tier.minutes + ' minutes.'];
+  const lines = ['Plan purchased for ' + (model.display_name || model.id) + ': ' + tier.minutes + ' minutes' + (paymentMethod === 'lift' ? ' (paid with LIFT).' : '.')];
   if (result.payment && result.payment.txid) {
     lines.push('Transaction: ' + result.payment.txid);
   }
@@ -457,13 +485,14 @@ const TOOLS = [
   },
   {
     name: 'buy_plan',
-    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS BCH FROM THE WALLET — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session.',
+    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens.',
     inputSchema: {
       type: 'object',
       required: ['model', 'minutes'],
       properties: {
         model: { type: 'string', description: 'Model id or display name, e.g. deepseek/deepseek-v4-flash or DeepSeek V4 Flash.' },
         minutes: { type: 'number', description: 'Plan duration in minutes, e.g. 30 for the 30-minute tier.' },
+        payment_method: { type: 'string', enum: ['bch', 'lift'], description: 'Payment method. bch (default) pays from the BCH balance. Set to lift when the user says "pay with LIFT" or "pay with LIFT tokens" — this sells the wallet LIFT token balance via Cauldron to fund the plan. Use lift when the wallet lacks BCH but holds LIFT, or when the user explicitly asks to pay with LIFT.' },
       },
     },
   },
