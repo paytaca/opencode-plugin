@@ -78,6 +78,30 @@ try {
   process.exit(1);
 }
 
+// Cauldron payment support (opt-in via config.paymentMethod === 'lift').
+// The LIFT token is sold in a single swap transaction whose output pays the
+// x402 payTo address directly. Uses the same machinery as paytaca-cli's
+// "paytaca swap" command, imported via absolute paths because the wrapper runs
+// outside any node_modules tree.
+const LIFT_TOKEN_ID = process.env.PAYTACA_PAYMENT_TOKEN_ID || '5932b2fd4915d6a75d3ec53282cd49118149a2176ee67ed68b1111ff0786f7fc';
+let cauldronLoaded = false;
+let fetchPoolsForToken, apiPoolToMicroPool, microPoolToPoolV0, attemptTrade, watchtowerUtxosToSpendableCoins, ExchangeLab, PayoutAmountRuleType, cashAddressToLockingBytecode, binToHex;
+try {
+  const basePath = findPaytacaCliPath();
+  const cauldronDir = join(basePath, 'dist', 'wallet', 'cauldron');
+  const cashlabDir = join(basePath, 'node_modules', '@cashlab');
+  ({ fetchPoolsForToken } = await import(join(cauldronDir, 'api.js')));
+  ({ apiPoolToMicroPool, microPoolToPoolV0 } = await import(join(cauldronDir, 'pools.js')));
+  ({ attemptTrade, watchtowerUtxosToSpendableCoins } = await import(join(cauldronDir, 'transact.js')));
+  ({ default: ExchangeLab } = await import(join(cashlabDir, 'cauldron', 'out', 'exchange-lab.js')));
+  ({ PayoutAmountRuleType } = await import(join(cashlabDir, 'common', 'out', 'constants.js')));
+  ({ cashAddressToLockingBytecode, binToHex } = await import(join(cashlabDir, 'common', 'out', 'libauth.js')));
+  cauldronLoaded = true;
+} catch (err) {
+  // Cauldron modules are only needed for LIFT payments; BCH payments still work.
+  cauldronLoaded = false;
+}
+
 async function main() {
   const configPath = process.argv[2];
   if (!configPath) {
@@ -86,7 +110,7 @@ async function main() {
   }
 
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  const { url, method, headers, bodyFile, chipnet, confirmed } = config;
+  const { url, method, headers, bodyFile, chipnet, confirmed, paymentMethod } = config;
 
   const body = readFileSync(bodyFile, 'utf8');
 
@@ -103,7 +127,7 @@ async function main() {
   const x402Payer = new X402Payer({ hdWallet, addressIndex: 0 });
 
   try {
-    const result = await executePay(url, method, headers, body, bchWallet, x402Payer, isChipnet, confirmed);
+    const result = await executePay(url, method, headers, body, bchWallet, hdWallet, x402Payer, isChipnet, confirmed, paymentMethod);
     console.log(JSON.stringify(result, null, 2));
   } catch (err) {
     console.log(JSON.stringify({ success: false, error: err.message || String(err) }, null, 2));
@@ -111,7 +135,99 @@ async function main() {
   }
 }
 
-async function executePay(url, method, headers, body, bchWallet, x402Payer, isChipnet, confirmed) {
+// Sell LIFT tokens via Cauldron in a single swap transaction that pays the
+// x402 payTo address directly. Returns { txid, vout } for the payment payload.
+async function payWithLift(bchWallet, hdWallet, requirements, changeAddress) {
+  if (!cauldronLoaded) {
+    throw new Error('Cauldron payment modules unavailable. Update paytaca-cli to 0.5.0+ to pay with LIFT.');
+  }
+  const tokenId = LIFT_TOKEN_ID;
+  const amountSats = BigInt(requirements.amount);
+
+  const [apiPools, allUtxos, tokenUtxos] = await Promise.all([
+    fetchPoolsForToken(tokenId),
+    bchWallet.getUtxos(),
+    bchWallet.getUtxos({ category: tokenId }),
+  ]);
+  if (!apiPools || apiPools.length === 0) {
+    throw new Error('No active Cauldron pools for the payment token.');
+  }
+  const pools = apiPools.map(apiPoolToMicroPool).map(microPoolToPoolV0);
+
+  const tokenBalance = (tokenUtxos || []).reduce((sum, u) => sum + BigInt(u.amount || 0), 0n);
+  if (tokenBalance <= 0n) {
+    throw new Error('No LIFT tokens in the wallet. Add LIFT to pay this plan with tokens, or pay with BCH.');
+  }
+
+  const bchUtxos = allUtxos.filter((utxo) => !utxo.is_cashtoken);
+  const spendableCoins = watchtowerUtxosToSpendableCoins({
+    utxos: [...bchUtxos, ...(tokenUtxos || [])],
+    wallet: hdWallet,
+  });
+  if (spendableCoins.length === 0) {
+    throw new Error('No spendable UTXOs available.');
+  }
+
+  const payToDecoded = cashAddressToLockingBytecode(requirements.payTo);
+  if (!payToDecoded || typeof payToDecoded === 'string' || !payToDecoded.bytecode) {
+    throw new Error('Invalid payment address: ' + requirements.payTo);
+  }
+  const changeDecoded = cashAddressToLockingBytecode(changeAddress);
+  if (!changeDecoded || typeof changeDecoded === 'string' || !changeDecoded.bytecode) {
+    throw new Error('Invalid change address: ' + changeAddress);
+  }
+
+  const exlab = new ExchangeLab();
+  const payoutRules = [
+    { type: PayoutAmountRuleType.FIXED, locking_bytecode: payToDecoded.bytecode, amount: amountSats },
+    { type: PayoutAmountRuleType.CHANGE, locking_bytecode: changeDecoded.bytecode, allow_mixing_native_and_token: false, allow_mixing_native_and_token_when_bch_change_is_dust: false, add_change_to_txfee_when_bch_change_is_dust: true },
+  ];
+
+  // Back-compute the token supply for a demand target slightly above the plan
+  // cost so the received BCH covers the fixed payout plus fees (excess becomes
+  // change). Retry with a bigger buffer if the first target leaves no change.
+  let trade = null;
+  let tradeTx = null;
+  let lastError = null;
+  for (const buffer of [2000n, 20000n, 100000n]) {
+    try {
+      trade = attemptTrade({ pools, isBuyingToken: false, supply: undefined, demand: amountSats + buffer });
+      tradeTx = exlab.createTradeTx(trade.entries, spendableCoins, payoutRules, null, 1n);
+      exlab.verifyTradeTx(tradeTx);
+      break;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  if (!tradeTx) {
+    const supply = trade?.summary?.supply;
+    if (supply && tokenBalance < supply) {
+      throw new Error('Insufficient LIFT balance: this payment needs ' + supply + ' base units but the wallet has ' + tokenBalance + '.');
+    }
+    throw new Error('Could not fund the payment by selling LIFT: ' + (lastError?.message || 'unknown error'));
+  }
+
+  const tx = tradeTx.libauth_generated_transaction;
+  const payToHex = binToHex(payToDecoded.bytecode);
+  const vout = tx.outputs.findIndex((o) => binToHex(o.lockingBytecode) === payToHex);
+  if (vout === -1) {
+    throw new Error('Payment output missing from built transaction.');
+  }
+
+  const txHex = binToHex(tradeTx.txbin);
+  const broadcastResponse = await bchWallet.watchtower.BCH._api.post('broadcast/', { transaction: txHex });
+  const data = broadcastResponse.data;
+  if (data?.result) {
+    data[data.success ? 'txid' : 'error'] = data.result;
+    delete data.result;
+  }
+  if (!data?.success || !data?.txid) {
+    throw new Error(data?.error || 'Broadcast failed');
+  }
+  return { txid: data.txid, vout };
+}
+
+async function executePay(url, method, headers, body, bchWallet, hdWallet, x402Payer, isChipnet, confirmed, paymentMethod) {
   const response = await fetch(url, {
     method,
     headers,
@@ -151,13 +267,21 @@ async function executePay(url, method, headers, body, bchWallet, x402Payer, isCh
       };
     }
 
-    const sendResult = await bchWallet.sendBch(amountBch, address, changeAddress);
-    if (!sendResult.success) {
-      return { success: false, status: 402, payment: { required: true, error: sendResult.error }, error: sendResult.error };
+    let txid, vout = 0;
+    if (paymentMethod === 'lift') {
+      // Sell LIFT via Cauldron; the swap transaction pays the plan directly.
+      const liftPayment = await payWithLift(bchWallet, hdWallet, requirements, changeAddress);
+      txid = liftPayment.txid;
+      vout = liftPayment.vout;
+    } else {
+      const sendResult = await bchWallet.sendBch(amountBch, address, changeAddress);
+      if (!sendResult.success) {
+        return { success: false, status: 402, payment: { required: true, error: sendResult.error }, error: sendResult.error };
+      }
+      txid = sendResult.txid;
     }
 
-    const txid = sendResult.txid;
-    const paymentPayload = await x402Payer.createPaymentPayload(requirements, paymentRequired.resource.url, txid, 0, requirements.amount);
+    const paymentPayload = await x402Payer.createPaymentPayload(requirements, paymentRequired.resource.url, txid, vout, requirements.amount);
     headers['PAYMENT-SIGNATURE'] = JSON.stringify(paymentPayload);
 
     let retryResponse;
@@ -186,7 +310,7 @@ async function executePay(url, method, headers, body, bchWallet, x402Payer, isCh
       statusText: retryResponse.statusText,
       headers: retryResponseHeaders,
       data: retryResponseData,
-      payment: { required: true, txid, recipientAddress: address },
+      payment: { required: true, txid, recipientAddress: address, method: paymentMethod === 'lift' ? 'lift' : 'bch' },
     };
   }
 
