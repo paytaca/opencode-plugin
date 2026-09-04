@@ -226,6 +226,13 @@ async function payWithLift(bchWallet, hdWallet, requirements, changeAddress) {
 }
 
 async function executePay(url, method, headers, body, bchWallet, hdWallet, x402Payer, isChipnet, confirmed, paymentMethod) {
+  // Tell the backend the payment method so it can apply the LIFT discount and
+  // record how the plan was paid. Set once here — the same headers object is
+  // reused for the 402 fetch and the PAYMENT-SIGNATURE retry.
+  if (paymentMethod === 'lift') {
+    headers['X-Payment-Method'] = 'lift';
+  }
+
   const response = await fetch(url, {
     method,
     headers,
