@@ -173,17 +173,21 @@ async function startProxy(configDir, config) {
     const logFile = (0, config_1.getLogFile)(configDir);
     const wrapperScript = (0, config_1.getWrapperScript)(configDir);
     (0, config_1.ensureConfigDir)(configDir);
+    // Always refresh the payment wrapper on disk. It is executed fresh on every
+    // payment, so it must never go stale even when the proxy is reused/restarted.
+    fs.writeFileSync(wrapperScript, wrapper_1.WRAPPER_SCRIPT_CONTENT, 'utf8');
+    fs.chmodSync(wrapperScript, '755');
     const currentHash = scriptHash();
     const persistedConfig = (0, config_1.loadConfig)(configDir);
     let existingStatus = await getProxyStatus(configDir);
     const needsRestart = existingStatus.running &&
         (existingStatus.pid || 0) > 0 &&
         persistedConfig.proxyScriptHash !== currentHash;
-    fs.writeFileSync(proxyScript, proxy_1.PROXY_SCRIPT_CONTENT, 'utf8');
-    fs.chmodSync(proxyScript, '755');
     if (existingStatus.running && existingStatus.pid && existingStatus.port && !needsRestart) {
         return await reuseExistingProxy(configDir, config, { port: existingStatus.port, pid: existingStatus.pid }, currentHash);
     }
+    fs.writeFileSync(proxyScript, proxy_1.PROXY_SCRIPT_CONTENT, 'utf8');
+    fs.chmodSync(proxyScript, '755');
     if (existingStatus.running && existingStatus.pid) {
         try {
             process.kill(existingStatus.pid);
@@ -197,8 +201,6 @@ async function startProxy(configDir, config) {
     if (adopted) {
         return adopted;
     }
-    fs.writeFileSync(wrapperScript, wrapper_1.WRAPPER_SCRIPT_CONTENT, 'utf8');
-    fs.chmodSync(wrapperScript, '755');
     const paytacaCmd = getPaytacaCommand();
     const MAX_ATTEMPTS = 3;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
