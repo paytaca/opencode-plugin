@@ -142,6 +142,40 @@ function formatDuration(totalSeconds) {
   return minutes + ':' + String(secs).padStart(2, '0');
 }
 
+// Q&A guide about the wallet, buying plans, Paytaca AI, and Bitcoin Cash.
+// The assistant fetches this when the user asks "how do I...", "what is...",
+// or anything about funding, paying, or how the service works.
+const FAQ = [
+  ['What is Paytaca AI?', 'Paytaca AI is a service that gives you affordable, convenient access to AI inference through your Paytaca wallet. Instead of per-token metering or a monthly subscription, you buy short time-based plans in advance — 15, 30, or 60 minutes of a model — and use them up as you chat.'],
+  ['What makes Paytaca AI different from other AI services?', 'We keep AI access affordable and simple by billing in pre-purchased blocks of time rather than per token. Pick a model, buy a 15/30/60-minute plan with your wallet, and the time is yours to use. No surprises per message, no recurring billing.'],
+  ['Did this plugin create a wallet for me?', 'Yes. Installing the Paytaca AI opencode plugin automatically created a Paytaca wallet on this device (a Bitcoin Cash wallet). Any BCH or LIFT tokens you send to its address are available to this plugin to spend.'],
+  ['How do I fund my wallet?', 'Get your wallet\\'s receiving address (ask "what\\'s my address?" or call get_receiving_address), then send BCH or LIFT tokens to it from any Bitcoin Cash wallet or exchange. Funding must happen BEFORE you can buy a plan. Check your balance anytime with get_balance.'],
+  ['How do I buy a plan?', 'Three steps: (1) make sure your wallet has funds — get_receiving_address to deposit, get_balance to confirm; (2) see pricing with get_plans; (3) ask to buy, e.g. "Buy a DeepSeek V4 Flash plan for 30 minutes." opencode will ask you to approve the payment.'],
+  ['Can I pay with LIFT tokens?', 'Yes. Plans can be paid in BCH or LIFT tokens. To pay with tokens, add "pay with LIFT" to your buy request, e.g. "Buy a 15-minute GLM plan and pay with LIFT." Paying with LIFT applies a discount — see the current rate below (the backend sets it, so it can change anytime).'],
+  ['Why can\\'t I buy again while I still have credits?', 'Plans are time blocks, not balances that stack. While a model still has active time, buying another plan for it would charge nothing extra. Use up or wait out the remaining credits, then buy again. Check remaining time with get_credits.'],
+  ['What is Bitcoin Cash (BCH)?', 'Bitcoin Cash is peer-to-peer electronic cash. Transactions are confirmed in seconds to minutes with extremely low fees (fractions of a cent), which makes it practical for small, everyday payments like buying a plan. It is the currency Paytaca AI payments run on.'],
+  ['What are CashTokens and LIFT?', 'CashTokens are fungible and non-fungible tokens issued on the Bitcoin Cash blockchain. LIFT is a Paytaca CashToken you can use to pay for AI plans, and it can be bought/sold for BCH on the Cauldron DEX.'],
+  ['What is Paytaca?', 'Paytaca is a Bitcoin Cash wallet and payments ecosystem, and Paytaca AI is its AI inference service. The Paytaca wallet app holds your BCH and CashTokens, and Paytaca AI lets you spend them on AI usage.'],
+].map(([q, a]) => '- **' + q + '**\\n  ' + a).join('\\n');
+
+// Appended to Paytaca AI info tool outputs (plans, credits, models): asks the
+// user what they want to do next and steers them toward buying a plan, with
+// concrete example prompts they can reuse to place the order.
+async function nextSteps() {
+  const percent = await getLiftDiscountPercent();
+  const liftLine = percent > 0
+    ? '- Pay with LIFT tokens instead of BCH: just add "pay with LIFT" to your request, e.g. "Buy a 30-minute GLM plan and pay with LIFT." — you get **' + percent + '% off**.'
+    : '- Pay with LIFT tokens instead of BCH: just add "pay with LIFT" to your request, e.g. "Buy a 30-minute GLM plan and pay with LIFT."';
+  return [
+    '',
+    'What would you like to do next?',
+    '- Buy a plan: pick a model and duration from the list above, then say something like: "Buy a DeepSeek V4 Flash plan for 15 minutes."',
+    liftLine,
+    '- Check your credits: "How much time do I have left?"',
+    '- See prices for another model: "Show me the plans for <model>."',
+  ].join('\\n');
+}
+
 // Remaining time credits per model session
 async function getCredits() {
   const data = await getJson(BACKEND_URL + '/v1/wallet/status', { 'X-Wallet-Hash': WALLET_HASH });
@@ -166,9 +200,19 @@ async function getCredits() {
     }
   }
   if (parts.length === 0) {
-    return 'No active time credits.';
+    return 'No active time credits.' + await nextSteps();
   }
-  return parts.join('\\n');
+  return parts.join('\\n') + await nextSteps();
+}
+
+// Q&A guide about the wallet, buying plans, Paytaca AI, and Bitcoin Cash.
+async function getHelp() {
+  let liftLine = '';
+  const percent = await getLiftDiscountPercent();
+  if (percent > 0) {
+    liftLine = '\\n\\n💡 **Current LIFT discount: ' + percent + '%** off plans paid with LIFT tokens.';
+  }
+  return 'Paytaca AI and your wallet — frequently asked questions:\\n\\n' + FAQ + liftLine + await nextSteps();
 }
 
 // Wallet BCH balance via the paytaca CLI
@@ -192,10 +236,11 @@ async function getModels() {
     if (m.tier) line += ' [' + m.tier + ']';
     lines.push('- ' + line);
   }
-  return lines.join('\\n');
+  return lines.join('\\n') + await nextSteps();
 }
 
-// Plan pricing as a markdown table per model, optionally filtered to one model
+// Plan pricing as a compact matrix: models as rows, durations as columns,
+// with USD and BCH price in each cell. Durations are always 15/30/60 min.
 async function getPlans(filterModel) {
   const data = await getJson(BACKEND_URL + '/v1/config', {});
   let models = Array.isArray(data.models) ? data.models : [];
@@ -208,33 +253,31 @@ async function getPlans(filterModel) {
     });
   }
   if (models.length === 0) {
-    return 'No models available.';
+    return 'No models available.' + await nextSteps();
   }
-  const lines = [];
+  const durationColumns = [15, 30, 60];
+  const lines = ['| Model | 15 min | 30 min | 60 min |', '|---|---|---|---|'];
   for (const m of models) {
     const name = m.display_name || m.id;
     const tier = m.tier ? String(m.tier).charAt(0).toUpperCase() + String(m.tier).slice(1) : '';
     const tierInName = tier && name.toLowerCase().indexOf(tier.toLowerCase()) !== -1;
-    if (lines.length > 0) lines.push('');
-    lines.push('**' + name + (tier && !tierInName ? ' (' + tier + ')' : '') + '**');
-    lines.push('');
+    const label = name + (tier && !tierInName ? ' (' + tier + ')' : '');
     const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
-    if (tiers.length === 0) {
-      lines.push('No pricing configured.');
-      continue;
+    const byMinutes = {};
+    for (const t of tiers) {
+      byMinutes[Number(t.minutes)] = t;
     }
-    lines.push('| Duration | USD | BCH | Sats |');
-    lines.push('|---|---|---|---|');
-    const sorted = tiers.slice().sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
-    for (const t of sorted) {
+    const cells = durationColumns.map((mins) => {
+      const t = byMinutes[mins];
+      if (!t) return '-';
       const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
       const bch = (sats / 100000000).toFixed(8);
       const usd = typeof t.price_usd === 'number' ? '$' + t.price_usd.toFixed(2) : '?.??';
-      const satsStr = Number(sats).toLocaleString('en-US');
-      lines.push('| ' + (t.minutes || 0) + ' min | ' + usd + ' | ' + bch + ' | ' + satsStr + ' |');
-    }
+      return usd + ' / ' + bch + ' BCH';
+    });
+    lines.push('| ' + label + ' | ' + cells.join(' | ') + ' |');
   }
-  return lines.join('\\n');
+  return lines.join('\\n') + await nextSteps();
 }
 
 // Resolve a model (by id or display name) and its price tier by minutes.
@@ -280,6 +323,31 @@ async function getLiftBalanceUnits() {
   return BigInt(Math.round(parseFloat(match[1]) * 100));
 }
 
+// LIFT payment discount percent advertised by the backend (/v1/config), cached
+// for ~5 minutes. Returns 0 when unset/unavailable so callers can fall back to
+// no-discount messaging.
+let liftDiscountCache = { at: 0, percent: 0 };
+async function getLiftDiscountPercent() {
+  const now = Date.now();
+  if (liftDiscountCache.at && now - liftDiscountCache.at < 300000) {
+    return liftDiscountCache.percent;
+  }
+  let percent = 0;
+  try {
+    const data = await getJson(BACKEND_URL + '/v1/config', {});
+    percent = Number(data.lift_payment_discount_percent) || 0;
+  } catch (e) {
+    log('Failed to fetch LIFT discount config: ' + e.message);
+  }
+  liftDiscountCache = { at: now, percent };
+  return percent;
+}
+
+// Format a satoshi amount as a BCH string with up to 8 decimals.
+function formatBch(sats) {
+  return (Number(sats) / 100000000).toFixed(8);
+}
+
 // Purchase time credits for a specific model and plan duration. Reuses the
 // same payment wrapper the proxy runs on a 402 (x402 payment + retry with the
 // PAYMENT-SIGNATURE header), but works for ANY model/tier the user picks —
@@ -297,6 +365,24 @@ async function buyPlan(args) {
 
   const { model, tier } = await resolvePlan(modelFilter, minutes);
   const priceSats = Number(tier.price_sats) || 0;
+
+  // Explicit restriction: a plan cannot be purchased while the model still has
+  // active credits. The backend serves requests without a 402 once credits are
+  // active, so buying again would silently charge nothing and the user would
+  // think they stacked time. Block the purchase and tell them to use up the
+  // remaining credits (or wait for them to expire) before buying again.
+  let status;
+  try {
+    status = await getJson(BACKEND_URL + '/v1/wallet/status', { 'X-Wallet-Hash': WALLET_HASH });
+  } catch (e) {
+    throw new Error('Could not check existing credits before purchase: ' + e.message + '. Try again, or check credits with get_credits.');
+  }
+  const sessions = Array.isArray(status.sessions) ? status.sessions : [];
+  const existing = sessions.find((s) => s.ai_model === model.id && s.time_remaining_seconds > 0);
+  if (existing) {
+    const remaining = formatDuration(existing.time_remaining_seconds);
+    throw new Error((model.display_name || model.id) + ' still has ' + remaining + ' of active credits. A new plan cannot be purchased until the remaining credits are used up or expire. Check credits with get_credits and buy again once they run out.');
+  }
 
   // Fail fast on insufficient balance instead of sending a txn that cannot
   // fund the plan (mirrors the proxy's 402 flow). Only applies to BCH — the
@@ -335,6 +421,9 @@ async function buyPlan(args) {
     'X-Model-Id': model.id,
     'X-Duration-Minutes': String(tier.minutes),
   };
+  if (paymentMethod === 'lift') {
+    extraHeaders['X-Payment-Method'] = 'lift';
+  }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'paytaca-buy-plan-'));
   const bodyFile = path.join(tmpDir, 'body.json');
@@ -381,7 +470,24 @@ async function buyPlan(args) {
     throw new Error(result.error || 'Payment failed (status ' + result.status + ').');
   }
 
+  const paid = result.payment && result.payment.required;
+  if (!paid) {
+    // No payment was required — the model already had active credits, so the
+    // server served the request for free. Report this instead of claiming a
+    // purchase so the user knows nothing was charged.
+    return 'No purchase made: ' + (model.display_name || model.id) + ' already has active credits, so the request was served without payment. Check your credits with get_credits.';
+  }
+
   const lines = ['Plan purchased for ' + (model.display_name || model.id) + ': ' + tier.minutes + ' minutes' + (paymentMethod === 'lift' ? ' (paid with LIFT).' : '.')];
+  if (paymentMethod === 'lift') {
+    const discountPercent = await getLiftDiscountPercent();
+    if (discountPercent > 0) {
+      const discountSats = Math.round(priceSats * (discountPercent / 100));
+      lines.push('**LIFT discount applied: ' + discountPercent + '% — you saved ' + formatBch(discountSats) + ' BCH.**');
+    } else {
+      lines.push('Paid with LIFT tokens.');
+    }
+  }
   if (result.payment && result.payment.txid) {
     lines.push('Transaction: ' + result.payment.txid);
   }
@@ -459,6 +565,11 @@ async function sendFunds(args) {
 // Tool schemas (concise descriptions so MCP tool context stays small)
 const TOOLS = [
   {
+    name: 'get_help',
+    description: 'Get a Q&A guide about the Paytaca wallet, funding it, buying plans, paying with BCH or LIFT, what makes Paytaca AI unique, Bitcoin Cash, CashTokens/LIFT, and Paytaca itself. Use when the user asks how the wallet or buying works, how to fund or top up, what Paytaca AI is, what makes it different, or anything about Bitcoin Cash, CashTokens, or LIFT.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'get_credits',
     description: 'Get remaining Paytaca AI time credits (active model sessions, time left). Use when the user asks about credits, remaining time, session status, or how much usage they have left.',
     inputSchema: { type: 'object', properties: {} },
@@ -485,7 +596,7 @@ const TOOLS = [
   },
   {
     name: 'buy_plan',
-    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens.',
+    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. IMPORTANT RESTRICTION: a plan CANNOT be purchased while the model still has active credits — the backend serves requests without payment once credits are active, so buying again charges nothing and does not stack time. Before calling, check the model\\'s credits with get_credits; if the model still has time remaining, do NOT buy — tell the user to use up or wait out the remaining credits first. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens. Paying with LIFT gets a discount (rate set server-side; see get_help or get_plans for the current percent).',
     inputSchema: {
       type: 'object',
       required: ['model', 'minutes'],
@@ -574,6 +685,7 @@ function handleMessage(msg) {
       let text;
       try {
         switch (name) {
+          case 'get_help': text = await getHelp(); break;
           case 'get_credits': text = await getCredits(); break;
           case 'get_balance': text = await getBalance(); break;
           case 'get_models': text = await getModels(); break;

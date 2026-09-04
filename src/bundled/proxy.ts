@@ -108,6 +108,43 @@ async function getWalletBalance() {
   }
 }
 
+// LIFT token balance in base units (2 decimals); null when unavailable.
+const LIFT_TOKEN_ID = '5932b2fd4915d6a75d3ec53282cd49118149a2176ee67ed68b1111ff0786f7fc';
+async function getLiftBalance() {
+  try {
+    const output = await runCommand(PAYTACA_CMD, ['token', 'info', LIFT_TOKEN_ID]);
+    const match = output.match(/Balance:\\s*([\\d.]+)\\s*LIFT/i);
+    if (match) return Math.round(parseFloat(match[1]) * 100);
+    return null;
+  } catch (err) {
+    log('Failed to get LIFT balance: ' + err.message);
+    return null;
+  }
+}
+
+// LIFT payment discount percent advertised by the backend (/v1/config), cached
+// briefly (30s) so a server-side rate change is picked up quickly. Returns 0
+// when unset/unavailable so callers can fall back to no-discount messaging.
+let liftDiscountCache = { at: 0, percent: 0 };
+async function getLiftDiscountPercent() {
+  const now = Date.now();
+  if (liftDiscountCache.at && now - liftDiscountCache.at < 30000) {
+    return liftDiscountCache.percent;
+  }
+  let percent = 0;
+  try {
+    const configRes = await fetch(BACKEND_URL + '/v1/config');
+    if (configRes.ok) {
+      const data = await configRes.json();
+      percent = Number(data.lift_payment_discount_percent) || 0;
+    }
+  } catch (err) {
+    log('Failed to fetch LIFT discount config: ' + err.message);
+  }
+  liftDiscountCache = { at: now, percent };
+  return percent;
+}
+
 // Utility: get receiving address
 async function getReceivingAddress() {
   try {
@@ -253,10 +290,20 @@ async function streamTierSelectionBody(res, walletHash, modelName, tiers, includ
     choices: [{ index: 0, delta: { content: tiersContent }, finish_reason: null }],
   });
 
+  // Advertise the LIFT discount when the backend advertises one.
+  const liftPercent = await getLiftDiscountPercent();
+  if (liftPercent > 0) {
+    sseLine(res, {
+      id: 'tier-10b',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: '\\n💡 **' + liftPercent + '% off** when you pay with LIFT tokens — type \`LIFT\` to pay with LIFT and get the discount.\\n' }, finish_reason: null }],
+    });
+  }
+
   sseLine(res, {
     id: 'tier-11',
     object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + '), e.g. type ' + tiers[0].minutes + ':\\n' }, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + ') to pay with BCH, or type \`LIFT\` to pay with LIFT tokens' + (liftPercent > 0 ? ' and get ' + liftPercent + '% off' : '') + ':\\n' }, finish_reason: 'stop' }],
   });
 
   // If other models still have paid credits, tell the user they can switch
@@ -729,7 +776,7 @@ async function streamPaymentFailureAndRetry(res, walletHash, pendingPayload, mes
 }
 
 // Run paytaca pay internally and return the response
-function runPaytacaPay(djangoUrl, body, walletHash, extraHeaders, callback) {
+function runPaytacaPay(djangoUrl, body, walletHash, extraHeaders, paymentMethod, callback) {
   const url = djangoUrl + '/chat/completions?wallet_hash=' + encodeURIComponent(walletHash || '');
   const payBody = forceNonStreaming(body);
 
@@ -751,6 +798,9 @@ function runPaytacaPay(djangoUrl, body, walletHash, extraHeaders, callback) {
     bodyFile,
     confirmed: true,
   };
+  if (paymentMethod === 'lift') {
+    config.paymentMethod = 'lift';
+  }
 
   try {
     fs.writeFileSync(configFile, JSON.stringify(config), 'utf8');
@@ -1165,20 +1215,43 @@ const server = http.createServer(async (req, res) => {
             await handlePricingCommand(res);
             return;
           }
+
+          // LIFT payment option: user typed "LIFT" (optionally followed by a
+          // tier number, e.g. "LIFT 2"). Defaults to the first tier.
+          let paymentMethod = 'bch';
+          if (timeCmd === 'lift' || (timeCmd && /^lift[\s]+\\d+$/.test(timeCmd))) {
+            paymentMethod = 'lift';
+          }
+          let liftTierIndex = -1;
+          if (timeCmd && /^lift[\s]+\\d+$/.test(timeCmd)) {
+            const liftNum = parseInt(timeCmd.split(/\\s+/)[1], 10);
+            if (!isNaN(liftNum) && liftNum >= 1 && liftNum <= pendingPayload.tiers.length) {
+              liftTierIndex = liftNum - 1;
+            }
+          }
+
           let selectedIndex = -1;
           
-          // Try to parse user input as a number (1-based)
-          const num = parseInt(userInput, 10);
-          if (!isNaN(num) && num >= 1 && num <= pendingPayload.tiers.length) {
-            selectedIndex = num - 1;
+          // "LIFT" alone selects the first (cheapest) tier paid with LIFT;
+          // "LIFT N" selects tier N.
+          if (paymentMethod === 'lift' && liftTierIndex >= 0) {
+            selectedIndex = liftTierIndex;
+          } else if (paymentMethod === 'lift') {
+            selectedIndex = 0;
           } else {
-            // Try to match by duration minutes
-            for (let i = 0; i < pendingPayload.tiers.length; i++) {
-              if (userInput === String(pendingPayload.tiers[i].minutes) ||
-                  userInput === pendingPayload.tiers[i].minutes + ' minutes' ||
-                  userInput === pendingPayload.tiers[i].minutes + ' min') {
-                selectedIndex = i;
-                break;
+            // Try to parse user input as a number (1-based)
+            const num = parseInt(userInput, 10);
+            if (!isNaN(num) && num >= 1 && num <= pendingPayload.tiers.length) {
+              selectedIndex = num - 1;
+            } else {
+              // Try to match by duration minutes
+              for (let i = 0; i < pendingPayload.tiers.length; i++) {
+                if (userInput === String(pendingPayload.tiers[i].minutes) ||
+                    userInput === pendingPayload.tiers[i].minutes + ' minutes' ||
+                    userInput === pendingPayload.tiers[i].minutes + ' min') {
+                  selectedIndex = i;
+                  break;
+                }
               }
             }
           }
@@ -1186,9 +1259,10 @@ const server = http.createServer(async (req, res) => {
           if (selectedIndex >= 0) {
             const selectedTier = pendingPayload.tiers[selectedIndex];
             pendingPayload.durationMinutes = selectedTier.minutes;
+            pendingPayload.paymentMethod = paymentMethod;
             pendingPayload.step = 'processing';
             
-            log('Tier selected: ' + selectedTier.minutes + ' min for wallet ' + walletHash?.substring(0, 16) + '...');
+            log('Tier selected: ' + selectedTier.minutes + ' min (' + paymentMethod + ') for wallet ' + walletHash?.substring(0, 16) + '...');
             
             // Build extra headers for payment wrapper
             const extraHeaders = {};
@@ -1196,28 +1270,56 @@ const server = http.createServer(async (req, res) => {
               extraHeaders['X-Model-Id'] = pendingPayload.modelId;
             }
             extraHeaders['X-Duration-Minutes'] = String(selectedTier.minutes);
+            if (paymentMethod === 'lift') {
+              extraHeaders['X-Payment-Method'] = 'lift';
+            }
             
-            // Check wallet balance before attempting payment
-            const currentBalanceSats = await getWalletBalance();
-            if (currentBalanceSats !== null && selectedTier.price_sats && currentBalanceSats < selectedTier.price_sats) {
-              log('Insufficient balance for wallet ' + walletHash?.substring(0, 16) + '...: ' + currentBalanceSats + ' sats < ' + selectedTier.price_sats + ' sats needed');
-              pendingPayments.delete(walletHash);
-              const addr = await getReceivingAddress();
-              const neededBch = (selectedTier.price_sats - currentBalanceSats) / 100000000;
-              const neededLine = addr ? '\\n\\n📥 **Fund your wallet:** \\\`' + addr + '\\\`\\nOr run: paytaca receive (in another terminal) for QR code' : '';
-              sseLine(res, {
-                id: 'balance-err',
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ **Insufficient balance** — You have **' + (currentBalanceSats / 100000000).toFixed(8) + ' BCH** but need **' + (selectedTier.price_sats / 100000000).toFixed(8) + ' BCH** for this plan. Top up at least **' + neededBch.toFixed(8) + ' BCH** more.' + neededLine + '\\n\\nType \\\`balance\\\` to re-check or try a different plan:' }, finish_reason: 'stop' }],
-              });
-              sseLine(res, {
-                id: 'balance-err-done',
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-              });
-              sseDone(res);
-              res.end();
-              return;
+            // Check wallet balance before attempting payment — only for BCH.
+            // The LIFT path sells tokens, so no BCH balance is required.
+            if (paymentMethod !== 'lift') {
+              const currentBalanceSats = await getWalletBalance();
+              if (currentBalanceSats !== null && selectedTier.price_sats && currentBalanceSats < selectedTier.price_sats) {
+                log('Insufficient balance for wallet ' + walletHash?.substring(0, 16) + '...: ' + currentBalanceSats + ' sats < ' + selectedTier.price_sats + ' sats needed');
+                pendingPayments.delete(walletHash);
+                const addr = await getReceivingAddress();
+                const neededBch = (selectedTier.price_sats - currentBalanceSats) / 100000000;
+                const neededLine = addr ? '\\n\\n📥 **Fund your wallet:** \\\`' + addr + '\\\`\\nOr run: paytaca receive (in another terminal) for QR code' : '';
+                sseLine(res, {
+                  id: 'balance-err',
+                  object: 'chat.completion.chunk',
+                  choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ **Insufficient balance** — You have **' + (currentBalanceSats / 100000000).toFixed(8) + ' BCH** but need **' + (selectedTier.price_sats / 100000000).toFixed(8) + ' BCH** for this plan. Top up at least **' + neededBch.toFixed(8) + ' BCH** more.' + neededLine + '\\n\\nType \\\`balance\\\` to re-check or try a different plan:' }, finish_reason: 'stop' }],
+                });
+                sseLine(res, {
+                  id: 'balance-err-done',
+                  object: 'chat.completion.chunk',
+                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                });
+                sseDone(res);
+                res.end();
+                return;
+              }
+            } else {
+              // LIFT path: fail fast if the wallet holds no LIFT tokens.
+              const liftBalanceUnits = await getLiftBalance();
+              if (liftBalanceUnits !== null && liftBalanceUnits <= 0) {
+                log('No LIFT tokens for wallet ' + walletHash?.substring(0, 16) + '...');
+                pendingPayments.delete(walletHash);
+                const addr = await getReceivingAddress();
+                const fundLine = addr ? '\\n\\n📥 **Add LIFT to your wallet:** \\\`' + addr + '\\\` (send LIFT tokens) or buy LIFT on the Cauldron DEX' : '';
+                sseLine(res, {
+                  id: 'lift-err',
+                  object: 'chat.completion.chunk',
+                  choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ **No LIFT tokens** — you need LIFT to pay with tokens. Add LIFT to your wallet, then type a plan number above or \\\`LIFT\\\` again.' + fundLine + '\\n\\nType \\\`balance\\\` to re-check:' }, finish_reason: 'stop' }],
+                });
+                sseLine(res, {
+                  id: 'lift-err-done',
+                  object: 'chat.completion.chunk',
+                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                });
+                sseDone(res);
+                res.end();
+                return;
+              }
             }
             
             // Keepalive during payment processing
@@ -1234,7 +1336,7 @@ const server = http.createServer(async (req, res) => {
               res.write(': keepalive\\n\\n');
             }, 2000);
 
-            runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, async (err, responseJson) => {
+            runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, pendingPayload.paymentMethod || 'bch', async (err, responseJson) => {
               pendingPayments.delete(walletHash);
               clearInterval(keepalive);
 
@@ -1297,7 +1399,18 @@ const server = http.createServer(async (req, res) => {
 
               if (wasStreaming) {
                 try {
-                  jsonToSse(res, chatCompletion, { prependContent: '\\n💳 Payment successful — generating your response...\\n\\n' });
+                  let prepend = '\\n💳 Payment successful — generating your response...\\n\\n';
+                  if (pendingPayload.paymentMethod === 'lift') {
+                    const liftPercent = await getLiftDiscountPercent();
+                    const selectedTier = (pendingPayload.tiers || []).find((t) => t.minutes === pendingPayload.durationMinutes);
+                    if (liftPercent > 0 && selectedTier && selectedTier.price_sats) {
+                      const savedBch = (selectedTier.price_sats * (liftPercent / 100) / 100000000).toFixed(8);
+                      prepend = '\\n💳 Payment successful — paid with LIFT (**' + liftPercent + '% off**, saved **' + savedBch + ' BCH**). Generating your response...\\n\\n';
+                    } else {
+                      prepend = '\\n💳 Payment successful — paid with LIFT tokens. Generating your response...\\n\\n';
+                    }
+                  }
+                  jsonToSse(res, chatCompletion, { prependContent: prepend });
                 } catch (e) { log('jsonToSse threw: ' + e.message); }
               } else {
                 try {
@@ -1343,7 +1456,7 @@ const server = http.createServer(async (req, res) => {
             res.write(': keepalive\\n\\n');
           }, 2000);
 
-          runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, (err, responseJson) => {
+          runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, 'bch', (err, responseJson) => {
             clearInterval(keepalive);
             if (err) {
               log('paytaca pay failed: ' + err.message);
