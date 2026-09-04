@@ -28,7 +28,8 @@ function findPaytacaCliPath() {
   // installs (e.g. the plugin's own node_modules) and per-node asdf globals
   // that \`npm root -g\` may not reflect when multiple node versions exist.
   try {
-    const bin = execSync('which paytaca', { encoding: 'utf8' }).trim();
+    const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+    const bin = execSync(\`\${whichCmd} paytaca\`, { encoding: 'utf8' }).trim();
     if (bin) {
       let dir = dirname(realpathSync(bin));
       for (let i = 0; i < 6; i++) {
