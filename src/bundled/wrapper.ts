@@ -8,7 +8,7 @@ export const WRAPPER_SCRIPT_CONTENT = `#!/usr/bin/env node
  * Imports paytaca-cli modules directly (avoids CLI argument size limits).
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, realpathSync } from 'fs';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -21,7 +21,23 @@ const PAY_TIMEOUT_MS = Number(process.env.PAYTACA_PAY_TIMEOUT_MS || 240000);
 // Find paytaca-cli installation
 function findPaytacaCliPath() {
   const possiblePaths = [];
-  
+
+  // Resolve the paytaca command itself when it's on PATH. This covers local
+  // installs (e.g. the plugin's own node_modules) and per-node asdf globals
+  // that \`npm root -g\` may not reflect when multiple node versions exist.
+  try {
+    const bin = execSync('which paytaca', { encoding: 'utf8' }).trim();
+    if (bin) {
+      let dir = dirname(realpathSync(bin));
+      for (let i = 0; i < 6; i++) {
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        possiblePaths.push(dir);
+        dir = parent;
+      }
+    }
+  } catch {}
+
   // Try to get global npm root
   try {
     const globalPath = execSync('npm root -g', { encoding: 'utf8' }).trim();
@@ -87,7 +103,7 @@ let fetchPoolsForToken, apiPoolToMicroPool, microPoolToPoolV0, attemptTrade, wat
 try {
   const basePath = findPaytacaCliPath();
   const cauldronDir = join(basePath, 'dist', 'wallet', 'cauldron');
-  const cashlabDir = join(basePath, 'node_modules', '@cashlab');
+  const cashlabDir = findCashlabDir(basePath);
   ({ fetchPoolsForToken } = await import(join(cauldronDir, 'api.js')));
   ({ apiPoolToMicroPool, microPoolToPoolV0 } = await import(join(cauldronDir, 'pools.js')));
   ({ attemptTrade, watchtowerUtxosToSpendableCoins } = await import(join(cauldronDir, 'transact.js')));
@@ -98,6 +114,22 @@ try {
 } catch (err) {
   // Cauldron modules are only needed for LIFT payments; BCH payments still work.
   cauldronLoaded = false;
+}
+
+// Locate the @cashlab package dir by walking up from the paytaca-cli path.
+// Handles hoisted installs (top-level node_modules) and nested installs.
+function findCashlabDir(cliPath) {
+  for (let dir = cliPath, i = 0; i < 8; i++) {
+    const candidate = join(dir, 'node_modules', '@cashlab');
+    try {
+      readFileSync(join(candidate, 'cauldron', 'out', 'exchange-lab.js'));
+      return candidate;
+    } catch {}
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
 }
 
 async function main() {

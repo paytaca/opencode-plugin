@@ -118,7 +118,27 @@ function runCommand(cmd, args, timeoutMs) {
       settled = true;
       clearTimeout(timer);
       if (code === 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || 'Command exited with code ' + code));
+      else {
+        // The pay wrapper writes JSON errors to stdout, not stderr. Fall back
+        // to stdout so the real error surfaces instead of "Command exited
+        // with code 1".
+        const errText = stderr.trim();
+        let message = errText || stdout.trim();
+        if (!message) {
+          message = 'Command exited with code ' + code;
+        } else {
+          // The pay wrapper writes { success:false, error } JSON to stdout.
+          if (!errText && message) {
+            try {
+              const parsed = JSON.parse(message);
+              message = (parsed && parsed.error) || message;
+            } catch (e) {}
+          } else if (errText && stdout.trim()) {
+            message = errText + '\n' + stdout.trim();
+          }
+        }
+        reject(new Error(message));
+      }
     });
     child.on('error', (err) => {
       if (settled) return;
