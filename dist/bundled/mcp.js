@@ -151,15 +151,16 @@ function runCommand(cmd, args, timeoutMs) {
   });
 }
 
-// Format seconds as MM:SS or HH:MM:SS
+// Format seconds as human-readable: "X min Y secs", "X hr Y min Z secs", or "X secs"
 function formatDuration(totalSeconds) {
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const secs = totalSeconds % 60;
-  if (hours > 0) {
-    return hours + ':' + String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
-  }
-  return minutes + ':' + String(secs).padStart(2, '0');
+  const parts = [];
+  if (hours > 0) parts.push(hours + ' hr');
+  if (minutes > 0) parts.push(minutes + ' min');
+  if (secs > 0 || parts.length === 0) parts.push(secs + ' secs');
+  return parts.join(' ');
 }
 
 // Q&A guide about the wallet, buying plans, Paytaca AI, and Bitcoin Cash.
@@ -206,18 +207,25 @@ async function getCredits() {
   const parts = [];
   if (active.length > 0) {
     parts.push('Active time credits:');
+    parts.push('');
+    parts.push('| Model | Remaining | Total | Used |');
+    parts.push('|---|---|---|---|');
     for (const s of active) {
+      const name = s.display_name || s.ai_model;
       const total = formatDuration(s.time_credits_seconds);
       const remaining = formatDuration(s.time_remaining_seconds);
       const used = formatDuration(s.time_used_seconds);
-      parts.push('- ' + (s.display_name || s.ai_model) + ': ' + remaining + ' remaining of ' + total + ' (' + used + ' used)');
+      parts.push('| ' + name + ' | ' + remaining + ' | ' + total + ' | ' + used + ' |');
     }
   }
   if (inactive.length > 0) {
     parts.push('');
     parts.push('Inactive models (credits but session not active):');
+    parts.push('');
+    parts.push('| Model | Remaining |');
+    parts.push('|---|---|');
     for (const s of inactive) {
-      parts.push('- ' + (s.display_name || s.ai_model) + ': ' + formatDuration(s.time_remaining_seconds) + ' remaining');
+      parts.push('| ' + (s.display_name || s.ai_model) + ' | ' + formatDuration(s.time_remaining_seconds) + ' |');
     }
   }
   if (parts.length === 0) {
@@ -260,8 +268,7 @@ async function getModels() {
   return lines.join('\\n') + await nextSteps();
 }
 
-// Plan pricing as a compact matrix: models as rows, durations as columns,
-// with USD and BCH price in each cell. Durations are always 15/30/60 min.
+// Plan pricing as a markdown table per model, optionally filtered to one model
 async function getPlans(filterModel) {
   const data = await getJson(BACKEND_URL + '/v1/config', {});
   let models = Array.isArray(data.models) ? data.models : [];
@@ -276,27 +283,28 @@ async function getPlans(filterModel) {
   if (models.length === 0) {
     return 'No models available.' + await nextSteps();
   }
-  const durationColumns = [15, 30, 60];
-  const lines = ['| Model | 15 min | 30 min | 60 min |', '|---|---|---|---|'];
+  const lines = [];
   for (const m of models) {
     const name = m.display_name || m.id;
     const tier = m.tier ? String(m.tier).charAt(0).toUpperCase() + String(m.tier).slice(1) : '';
     const tierInName = tier && name.toLowerCase().indexOf(tier.toLowerCase()) !== -1;
-    const label = name + (tier && !tierInName ? ' (' + tier + ')' : '');
+    if (lines.length > 0) lines.push('');
+    lines.push('**' + name + (tier && !tierInName ? ' (' + tier + ')' : '') + '**');
+    lines.push('');
     const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
-    const byMinutes = {};
-    for (const t of tiers) {
-      byMinutes[Number(t.minutes)] = t;
+    if (tiers.length === 0) {
+      lines.push('No pricing configured.');
+      continue;
     }
-    const cells = durationColumns.map((mins) => {
-      const t = byMinutes[mins];
-      if (!t) return '-';
+    lines.push('| Duration | USD | BCH |');
+    lines.push('|---|---|---|');
+    const sorted = tiers.slice().sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+    for (const t of sorted) {
       const sats = typeof t.price_sats === 'number' ? t.price_sats : 0;
       const bch = (sats / 100000000).toFixed(8);
       const usd = typeof t.price_usd === 'number' ? '$' + t.price_usd.toFixed(2) : '?.??';
-      return usd + ' / ' + bch + ' BCH';
-    });
-    lines.push('| ' + label + ' | ' + cells.join(' | ') + ' |');
+      lines.push('| ' + (t.minutes || 0) + ' min | ' + usd + ' | ' + bch + ' |');
+    }
   }
   return lines.join('\\n') + await nextSteps();
 }

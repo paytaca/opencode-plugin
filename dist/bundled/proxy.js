@@ -185,15 +185,16 @@ async function checkWallet() {
   }
 }
 
-// Format seconds as MM:SS or HH:MM:SS
+// Format seconds as human-readable: "X min Y secs", "X hr Y min Z secs", or "X secs"
 function formatDuration(totalSeconds) {
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const secs = totalSeconds % 60;
-  if (hours > 0) {
-    return hours + ':' + String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
-  }
-  return minutes + ':' + String(secs).padStart(2, '0');
+  const parts = [];
+  if (hours > 0) parts.push(hours + ' hr');
+  if (minutes > 0) parts.push(minutes + ' min');
+  if (secs > 0 || parts.length === 0) parts.push(secs + ' secs');
+  return parts.join(' ');
 }
 
 // SSE helper: write a data line
