@@ -62,7 +62,7 @@ let requestCounter = 0;
 // Utility: run shell command and return output
 function runCommand(cmd, args = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { shell: false });
+    const child = spawn(cmd, args, { shell: process.platform === 'win32' });
     let stdout = '';
     let stderr = '';
     

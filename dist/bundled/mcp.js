@@ -103,7 +103,7 @@ function getJson(url, headers) {
 // Run a shell command with a timeout
 function runCommand(cmd, args, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { shell: false });
+    const child = spawn(cmd, args, { shell: process.platform === 'win32' });
     let stdout = '';
     let stderr = '';
     let settled = false;

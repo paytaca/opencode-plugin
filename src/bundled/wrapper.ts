@@ -55,6 +55,11 @@ function findPaytacaCliPath() {
     '/opt/homebrew/lib/node_modules/paytaca-cli',
   );
   
+  // Windows global npm location
+  if (process.platform === 'win32' && process.env.APPDATA) {
+    possiblePaths.push(join(process.env.APPDATA, 'npm', 'node_modules', 'paytaca-cli'));
+  }
+  
   // Try current file's node_modules (for bundled installs)
   try {
     const currentFile = fileURLToPath(import.meta.url);
