@@ -214,147 +214,47 @@ function sseDone(res) {
 // the UI (zero-width characters don't render).
 const PROXY_MARKER = String.fromCharCode(0x200b, 0x200b, 0x200b, 0x200b);
 
-// Stream the tier-selection prompt body (SSE lines) into an in-progress response.
-// When includeRole is false the leading role delta is skipped, so the body can be
-// appended to a stream that already emitted content (e.g. after a payment failure).
-async function streamTierSelectionBody(res, walletHash, modelName, tiers, includeRole, otherModels) {
-  if (includeRole !== false) {
-    sseLine(res, {
-      id: 'tier-1',
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model: modelName,
-      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-    });
+// Stream a payment-required message when a 402 is intercepted.  The assistant
+// reads this message and calls the buy_plan MCP tool (which shows a proper
+// question dialog) to let the user pick model, duration, and payment method.
+async function streamPaymentRequiredMessage(res, modelName, tiers, otherModels) {
+  const tierLines = (tiers || []).map(t => {
+    const usd = t.price_usd != null ? '$' + t.price_usd.toFixed(2) : '';
+    const usdPart = usd ? usd + ' / ' : '';
+    const bch = (Number(t.price_sats || 0) / 100000000).toFixed(8);
+    return '| ' + t.minutes + ' min | ' + usdPart + bch + ' BCH |';
+  });
+
+  let message = '\\n\\n💳 **Payment required** — **' + (modelName || 'this model') + '** needs a plan before it can respond.\\n\\n';
+  if (tierLines.length > 0) {
+    message += '| Duration | Price |\\n|---|---|\\n' + tierLines.join('\\n') + '\\n';
   }
 
-  // Loading sequence
-  sseLine(res, {
-    id: 'tier-2',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: PROXY_MARKER + '⏳ Initializing Paytaca AI provider...\\n' }, finish_reason: null }],
-  });
-
-  const hasCli = await checkPaytacaCli();
-  sseLine(res, {
-    id: 'tier-3',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Checking Paytaca CLI... ' }, finish_reason: null }],
-  });
-  sseLine(res, {
-    id: 'tier-4',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: hasCli ? '✅\\n' : '❌ Not found\\n' }, finish_reason: null }],
-  });
-
-  const hasWallet = hasCli ? await checkWallet() : false;
-  sseLine(res, {
-    id: 'tier-5',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Checking wallet... ' }, finish_reason: null }],
-  });
-  sseLine(res, {
-    id: 'tier-6',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: hasWallet ? '✅\\n' : '❌ Not found\\n' }, finish_reason: null }],
-  });
-
-  const balanceSats = hasWallet ? await getWalletBalance() : null;
-  sseLine(res, {
-    id: 'tier-7',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: 'Fetching balance... ' }, finish_reason: null }],
-  });
-
-  let balanceStr;
-  if (balanceSats !== null) {
-    const bch = (balanceSats / 100000000).toFixed(8);
-    balanceStr = bch + ' BCH';
-    sseLine(res, {
-      id: 'tier-8',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: '✅ — ' + balanceStr + '\\n\\n' }, finish_reason: null }],
-    });
-  } else {
-    balanceStr = 'Unable to check';
-    sseLine(res, {
-      id: 'tier-8',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: '\\n' + balanceStr + '\\n\\n' }, finish_reason: null }],
-    });
-  }
-
-  // Tier selection
-  sseLine(res, {
-    id: 'tier-9',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '💳 Select a plan for **' + (modelName || 'AI Model') + '**\\n\\n' }, finish_reason: null }],
-  });
-
-  // Build all tier lines into one string so backtick markdown renders
-  // consistently (same as the 'plans' command).
-  let tiersContent = '';
-  for (let i = 0; i < tiers.length; i++) {
-    const tier = tiers[i];
-    const bchAmount = (tier.price_sats / 100000000).toFixed(8);
-    const label = '\`(' + String(i + 1) + ')\`  ';
-    // Display USD price if available, fall back to PHP for legacy backends
-    const priceDisplay = tier.price_usd !== undefined && tier.price_usd !== null
-      ? 'USD ' + tier.price_usd.toFixed(4)
-      : 'PHP ' + (tier.price_php ? tier.price_php.toFixed(2) : '?.??');
-    tiersContent += label + tier.minutes + ' minutes — ' + priceDisplay + ' (' + bchAmount + ' BCH)\\n';
-  }
-  sseLine(res, {
-    id: 'tier-10',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: tiersContent }, finish_reason: null }],
-  });
-
-  // Advertise the LIFT discount when the backend advertises one.
   const liftPercent = await getLiftDiscountPercent();
   if (liftPercent > 0) {
-    sseLine(res, {
-      id: 'tier-10b',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: '\\n💡 **' + liftPercent + '% off** when you pay with LIFT tokens — type \`LIFT\` to pay with LIFT and get the discount.\\n' }, finish_reason: null }],
-    });
+    message += '\\n💡 Pay with **LIFT tokens** for a **' + liftPercent + '% discount** — pass \`payment_method: "lift"\` to \`buy_plan\`.\\n';
   }
-
-  sseLine(res, {
-    id: 'tier-11',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: { content: '\\nEnter a number (1-' + tiers.length + ') to pay with BCH, or type \`LIFT\` to pay with LIFT tokens' + (liftPercent > 0 ? ' and get ' + liftPercent + '% off' : '') + ':\\n' }, finish_reason: 'stop' }],
-  });
-
-  // If other models still have paid credits, tell the user they can switch
-  // instead of buying a new plan (only when there is something to suggest).
   if (otherModels && otherModels.length > 0) {
-    sseLine(res, {
-      id: 'tier-9b',
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content: otherModelsHint(otherModels) }, finish_reason: null }],
-    });
+    message += '\\n' + otherModelsHint(otherModels);
   }
+  message += '\\nCall \`get_plans\` for more details, then use \`buy_plan\` to purchase.';
 
-  sseLine(res, {
-    id: 'tier-12',
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  });
-}
-
-// Build and stream a full tier-selection prompt (headers + body + [DONE]) to the client.
-async function streamTierSelectionPrompt(res, walletHash, modelName, tiers, otherModels) {
   if (!res.headersSent) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'X-Payment-Required': 'true',
       'Connection': 'keep-alive',
     });
   }
-  await streamTierSelectionBody(res, walletHash, modelName, tiers, true, otherModels);
+
+  sseLine(res, {
+    id: 'pay-msg',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: 'deepseek/deepseek-v4-flash',
+    choices: [{ index: 0, delta: { content: message }, finish_reason: 'stop' }],
+  });
+
   sseDone(res);
   res.end();
 }
@@ -773,8 +673,8 @@ function jsonToSse(res, chatCompletion, opts) {
 
 // Stream a payment-failure message, then re-show the tier-selection prompt so the
 // user can retry the same or a different plan without sending another message.
-// The pending payment is restored to the tier-select step so the next tier pick is
-// handled by the proxy instead of being forwarded fresh to Django.
+// Stream a payment-failure message and clear the pending payment.  The assistant
+// can retry by calling buy_plan again (or the user can type their message again).
 async function streamPaymentFailureAndRetry(res, walletHash, pendingPayload, message) {
   try {
     sseLine(res, {
@@ -786,14 +686,8 @@ async function streamPaymentFailureAndRetry(res, walletHash, pendingPayload, mes
     });
   } catch (e) {
   }
-  pendingPayload.step = 'tier_select';
-  pendingPayload.durationMinutes = null;
-  pendingPayments.set(walletHash, pendingPayload);
+  pendingPayments.delete(walletHash);
   try {
-    const tiers = Array.isArray(pendingPayload.tiers) ? pendingPayload.tiers : [];
-    if (tiers.length > 0) {
-      await streamTierSelectionBody(res, walletHash, pendingPayload.displayName || pendingPayload.modelId || 'AI Model', tiers, false);
-    }
     sseDone(res);
     res.end();
   } catch (e) {
@@ -1407,373 +1301,11 @@ const server = http.createServer(async (req, res) => {
       }
       
       if (pendingPayload) {
-        // Check for tier selection first
-        if (pendingPayload.step === 'tier_select' && pendingPayload.tiers && pendingPayload.tiers.length > 0) {
-          const userInput = stripSysRem(lastContent);
-          const timeCmd = userInput?.trim().toLowerCase();
-          if (isTimeCmd(timeCmd)) {
-            await handleTimeCreditsCommand(res, walletHash);
-            return;
-          }
-          if (isPricingCmd(timeCmd)) {
-            await handlePricingCommand(res);
-            return;
-          }
-
-          // LIFT payment option: user typed "LIFT" (optionally followed by a
-          // tier number, e.g. "LIFT 2"). Defaults to the first tier.
-          let paymentMethod = 'bch';
-          if (timeCmd === 'lift' || (timeCmd && /^lift[\s]+\\d+$/.test(timeCmd))) {
-            paymentMethod = 'lift';
-          }
-          let liftTierIndex = -1;
-          if (timeCmd && /^lift[\s]+\\d+$/.test(timeCmd)) {
-            const liftNum = parseInt(timeCmd.split(/\\s+/)[1], 10);
-            if (!isNaN(liftNum) && liftNum >= 1 && liftNum <= pendingPayload.tiers.length) {
-              liftTierIndex = liftNum - 1;
-            }
-          }
-
-          let selectedIndex = -1;
-          
-          // "LIFT" alone selects the first (cheapest) tier paid with LIFT;
-          // "LIFT N" selects tier N.
-          if (paymentMethod === 'lift' && liftTierIndex >= 0) {
-            selectedIndex = liftTierIndex;
-          } else if (paymentMethod === 'lift') {
-            selectedIndex = 0;
-          } else {
-            // Try to parse user input as a number (1-based)
-            const num = parseInt(userInput, 10);
-            if (!isNaN(num) && num >= 1 && num <= pendingPayload.tiers.length) {
-              selectedIndex = num - 1;
-            } else {
-              // Try to match by duration minutes
-              for (let i = 0; i < pendingPayload.tiers.length; i++) {
-                if (userInput === String(pendingPayload.tiers[i].minutes) ||
-                    userInput === pendingPayload.tiers[i].minutes + ' minutes' ||
-                    userInput === pendingPayload.tiers[i].minutes + ' min') {
-                  selectedIndex = i;
-                  break;
-                }
-              }
-            }
-          }
-          
-          if (selectedIndex >= 0) {
-            const selectedTier = pendingPayload.tiers[selectedIndex];
-            pendingPayload.durationMinutes = selectedTier.minutes;
-            pendingPayload.paymentMethod = paymentMethod;
-            pendingPayload.step = 'processing';
-            
-            log('Tier selected: ' + selectedTier.minutes + ' min (' + paymentMethod + ') for wallet ' + walletHash?.substring(0, 16) + '...');
-            
-            // Build extra headers for payment wrapper
-            const extraHeaders = {};
-            if (pendingPayload.modelId) {
-              extraHeaders['X-Model-Id'] = pendingPayload.modelId;
-            }
-            extraHeaders['X-Duration-Minutes'] = String(selectedTier.minutes);
-            if (paymentMethod === 'lift') {
-              extraHeaders['X-Payment-Method'] = 'lift';
-            }
-            
-            // Check wallet balance before attempting payment — only for BCH.
-            // The LIFT path sells tokens, so no BCH balance is required.
-            if (paymentMethod !== 'lift') {
-              const currentBalanceSats = await getWalletBalance();
-              if (currentBalanceSats !== null && selectedTier.price_sats && currentBalanceSats < selectedTier.price_sats) {
-                log('Insufficient balance for wallet ' + walletHash?.substring(0, 16) + '...: ' + currentBalanceSats + ' sats < ' + selectedTier.price_sats + ' sats needed');
-                pendingPayments.delete(walletHash);
-                const addr = await getReceivingAddress();
-                const neededBch = (selectedTier.price_sats - currentBalanceSats) / 100000000;
-                const neededLine = addr ? '\\n\\n📥 **Fund your wallet:** \\\`' + addr + '\\\`\\nOr run: paytaca receive (in another terminal) for QR code' : '';
-                sseLine(res, {
-                  id: 'balance-err',
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ **Insufficient balance** — You have **' + (currentBalanceSats / 100000000).toFixed(8) + ' BCH** but need **' + (selectedTier.price_sats / 100000000).toFixed(8) + ' BCH** for this plan. Top up at least **' + neededBch.toFixed(8) + ' BCH** more.' + neededLine + '\\n\\nType \\\`balance\\\` to re-check or try a different plan:' }, finish_reason: 'stop' }],
-                });
-                sseLine(res, {
-                  id: 'balance-err-done',
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                });
-                sseDone(res);
-                res.end();
-                return;
-              }
-            } else {
-              // LIFT path: fail fast if the wallet holds no LIFT tokens.
-              const liftBalanceUnits = await getLiftBalance();
-              if (liftBalanceUnits !== null && liftBalanceUnits <= 0) {
-                log('No LIFT tokens for wallet ' + walletHash?.substring(0, 16) + '...');
-                pendingPayments.delete(walletHash);
-                const addr = await getReceivingAddress();
-                const fundLine = addr ? '\\n\\n📥 **Add LIFT to your wallet:** \\\`' + addr + '\\\` (send LIFT tokens) or buy LIFT on the Cauldron DEX' : '';
-                sseLine(res, {
-                  id: 'lift-err',
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ **No LIFT tokens** — you need LIFT to pay with tokens. Add LIFT to your wallet, then type a plan number above or \\\`LIFT\\\` again.' + fundLine + '\\n\\nType \\\`balance\\\` to re-check:' }, finish_reason: 'stop' }],
-                });
-                sseLine(res, {
-                  id: 'lift-err-done',
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                });
-                sseDone(res);
-                res.end();
-                return;
-              }
-            }
-            
-            // Keepalive during payment processing
-            if (!res.headersSent) {
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Payment-Processing': 'true',
-              });
-            }
-            const keepalive = setInterval(() => {
-              if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
-              res.write(': keepalive\\n\\n');
-            }, 2000);
-
-            runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, pendingPayload.paymentMethod || 'bch', async (err, responseJson) => {
-              pendingPayments.delete(walletHash);
-              clearInterval(keepalive);
-
-              if (err) {
-                log('paytaca pay failed: ' + err.message);
-                if (res.headersSent && !res.destroyed && !res.writableEnded) {
-                  await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, '\\n\\n❌ Payment failed: ' + err.message + '\\n\\n');
-                } else if (!res.headersSent) {
-                  try {
-                    res.writeHead(500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
-                  } catch (e) { log('Failed to send payment error response: ' + e.message); }
-                } else {
-                  log('Cannot send payment failure — response already ended or destroyed');
-                }
-                return;
-              }
-              
-              if (!responseJson.success) {
-                const isTimeout = responseJson.timeout;
-                const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'credits\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error') + '\\n\\n';
-                const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
-                const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
-                const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
-                if (res.headersSent && !res.destroyed && !res.writableEnded) {
-                  if (isTimeout) {
-                    try {
-                      sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: PROXY_MARKER + sseContent }, finish_reason: 'stop' }] });
-                      sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-                      sseDone(res);
-                      res.end();
-                    } catch (e) { log('Failed to send timeout error via SSE: ' + e.message); }
-                  } else {
-                    await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, sseContent);
-                  }
-                } else if (!res.headersSent) {
-                  try {
-                    res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
-                  } catch (e) { log('Failed to send payment error JSON: ' + e.message); }
-                } else {
-                  log('Cannot send payment error — response already ended or destroyed');
-                }
-                return;
-              }
-              
-              const chatCompletion = responseJson?.data || responseJson;
-              
-              let wasStreaming = false;
-              try {
-                wasStreaming = JSON.parse(pendingPayload.body).stream === true;
-              } catch {}
-              
-              log('paytaca pay succeeded. Returning chat response.');
-              
-              if (res.destroyed || res.writableEnded) {
-                log('Payment succeeded but response connection is gone — cannot deliver chat response');
-                return;
-              }
-
-              if (wasStreaming) {
-                try {
-                  let prepend = '\\n💳 Payment successful — generating your response...\\n\\n';
-                  if (pendingPayload.paymentMethod === 'lift') {
-                    const liftPercent = await getLiftDiscountPercent();
-                    const selectedTier = (pendingPayload.tiers || []).find((t) => t.minutes === pendingPayload.durationMinutes);
-                    if (liftPercent > 0 && selectedTier && selectedTier.price_sats) {
-                      const savedBch = (selectedTier.price_sats * (liftPercent / 100) / 100000000).toFixed(8);
-                      prepend = '\\n💳 Payment successful — paid with LIFT (**' + liftPercent + '% off**, saved **' + savedBch + ' BCH**). Generating your response...\\n\\n';
-                    } else {
-                      prepend = '\\n💳 Payment successful — paid with LIFT tokens. Generating your response...\\n\\n';
-                    }
-                  }
-                  jsonToSse(res, chatCompletion, { prependContent: prepend });
-                } catch (e) { log('jsonToSse threw: ' + e.message); }
-              } else {
-                try {
-                  if (!res.headersSent) {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                  }
-                  res.end(JSON.stringify(chatCompletion));
-                } catch (e) { log('Failed to send non-streaming response: ' + e.message); }
-              }
-            });
-            return;
-          } else {
-            // Invalid selection — reshow the prompt
-            log('Invalid tier selection for wallet ' + walletHash?.substring(0, 16) + '...');
-            await streamTierSelectionPrompt(res, walletHash, pendingPayload.displayName || pendingPayload.modelId || 'AI Model', pendingPayload.tiers);
-            return;
-          }
-        }
-        
-        // Old flow: user responded to a yes/no payment prompt
-        if (stripSysRem(lastContent) === 'yes') {
-          log('Payment approved by wallet ' + walletHash?.substring(0, 16) + '...');
-          pendingPayments.delete(walletHash);
-          
-          const extraHeaders = {};
-          if (pendingPayload.modelId) {
-            extraHeaders['X-Model-Id'] = pendingPayload.modelId;
-          }
-          if (pendingPayload.durationMinutes) {
-            extraHeaders['X-Duration-Minutes'] = String(pendingPayload.durationMinutes);
-          }
-          
-          if (!res.headersSent) {
-            res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-              'X-Payment-Processing': 'true',
-            });
-          }
-          const keepalive = setInterval(() => {
-            if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
-            res.write(': keepalive\\n\\n');
-          }, 2000);
-
-          runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, 'bch', (err, responseJson) => {
-            clearInterval(keepalive);
-            if (err) {
-              log('paytaca pay failed: ' + err.message);
-              if (res.headersSent && !res.destroyed && !res.writableEnded) {
-                try {
-                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: PROXY_MARKER + '\\n\\n❌ Payment failed: ' + err.message }, finish_reason: 'stop' }] });
-                  sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-                  sseDone(res);
-                  res.end();
-                } catch (e) { log('Failed to send payment error via SSE: ' + e.message); }
-              } else if (!res.headersSent) {
-                try {
-                  res.writeHead(500, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ error: 'Payment failed', message: err.message, details: 'Please check your wallet balance and try again.' }));
-                } catch (e) { log('Failed to send payment error JSON: ' + e.message); }
-              } else {
-                log('Cannot send payment failure — response already ended or destroyed');
-              }
-              return;
-            }
-            
-            if (!responseJson.success) {
-              const isTimeout = responseJson.timeout;
-              const sseContent = isTimeout ? '\\n\\n⏱️ Response timed out. Your payment was processed \\u2014 check credits with \\'credits\\' and try again' : '\\n\\n❌ Payment failed: ' + (responseJson.error || 'Unknown error');
-              const errLabel = isTimeout ? 'Response timeout' : 'Payment failed';
-              const errMsg = isTimeout ? 'Response timed out. Payment was processed.' : responseJson.error;
-              const errDetails = isTimeout ? 'Try again or check credits with \\'credits\\'.' : 'Please check your balance and try again.';
-              if (res.headersSent && !res.destroyed && !res.writableEnded) {
-                try {
-                  sseLine(res, { id: 'pay-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: PROXY_MARKER + sseContent }, finish_reason: 'stop' }] });
-                  sseLine(res, { id: 'pay-err-done', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-                  sseDone(res);
-                  res.end();
-                } catch (e) { log('Failed to send error via SSE: ' + e.message); }
-              } else if (!res.headersSent) {
-                try {
-                  res.writeHead(responseJson.status || 500, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ error: errLabel, message: errMsg, details: errDetails }));
-                } catch (e) { log('Failed to send error JSON: ' + e.message); }
-              } else {
-                log('Cannot send payment error — response already ended or destroyed');
-              }
-              return;
-            }
-            
-            const chatCompletion = responseJson?.data || responseJson;
-            
-            let wasStreaming = false;
-            try {
-              wasStreaming = JSON.parse(pendingPayload.body).stream === true;
-            } catch {}
-            
-            log('paytaca pay succeeded. Returning chat response.');
-
-            if (res.destroyed || res.writableEnded) {
-              log('Payment succeeded but response connection is gone — cannot deliver chat response');
-              return;
-            }
-            
-            if (wasStreaming) {
-              try {
-                jsonToSse(res, chatCompletion, { prependContent: '\\n💳 Payment successful — generating your response...\\n\\n' });
-              } catch (e) { log('jsonToSse threw: ' + e.message); }
-            } else {
-              try {
-                if (!res.headersSent) {
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
-                }
-                res.end(JSON.stringify(chatCompletion));
-              } catch (e) { log('Failed to send non-streaming response: ' + e.message); }
-            }
-          });
-          return;
-          
-        } else if (stripSysRem(lastContent) === 'no') {
-          log('Payment declined by wallet ' + walletHash?.substring(0, 16) + '...');
-          pendingPayments.delete(walletHash);
-
-          const addr = await getReceivingAddress();
-          const fundMsg = addr
-            ? 'Fund your wallet: ' + addr
-            : 'You can fund your wallet by running: paytaca receive';
-
-          const declineCompletion = {
-            id: 'payment-declined',
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: pendingPayload.modelId || 'deepseek/deepseek-v4-flash',
-            choices: [{
-              index: 0,
-              message: {
-                role: 'assistant',
-                content: PROXY_MARKER + 'Payment declined. Chat cannot continue without funding.\\n\\n' + fundMsg,
-              },
-              finish_reason: 'stop',
-            }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          };
-          jsonToSse(res, declineCompletion);
-          return;
-          
-        } else {
-          const innerCmd = stripSysRem(lastContent?.trim().toLowerCase());
-          if (isTimeCmd(innerCmd)) {
-            await handleTimeCreditsCommand(res, walletHash);
-            return;
-          }
-          if (isPricingCmd(innerCmd)) {
-            await handlePricingCommand(res);
-            return;
-          }
-          log('New message while payment pending for wallet ' + walletHash?.substring(0, 16) + '...');
-        }
+        // Stale pending payment — clear it so the new request passes through
+        // to Django normally. Plan purchases are now handled via the buy_plan
+        // MCP tool (which shows a proper question dialog).
+        log('Clearing stale pending payment for wallet ' + walletHash?.substring(0, 16) + '...');
+        pendingPayments.delete(walletHash);
       }
       
       // Handle credits command — show remaining time credits
@@ -1873,11 +1405,12 @@ const server = http.createServer(async (req, res) => {
               }
             }
 
-            // New flow: show tier selection prompt. Also tell the user about
-            // other models that still have paid credits, so they can switch
-            // instead of buying a plan for the currently selected model.
+            // Payment required: tell the assistant the model needs a plan.
+            // The assistant will call buy_plan (which shows a question dialog)
+            // to let the user pick duration and payment method.
             const otherModels = await getOtherModelsWithCredits(walletHash, modelId || requestModel);
-            await streamTierSelectionPrompt(res, walletHash, displayName || modelId || 'AI Model', tiers, otherModels);
+            pendingPayments.delete(walletHash);
+            await streamPaymentRequiredMessage(res, displayName || modelId || 'AI Model', tiers, otherModels);
             return;
           }
           
