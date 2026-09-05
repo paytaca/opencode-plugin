@@ -449,6 +449,12 @@ async function buyPlan(args) {
   const extraHeaders = {
     'X-Model-Id': model.id,
     'X-Duration-Minutes': String(tier.minutes),
+    // Marks this as the internal buy_plan probe: the backend must answer with
+    // a plain 402 (payment-required) so the wrapper can trigger the x402
+    // payment flow. Without this, the prospective prompt text could match the
+    // backend's free grace-turn / concierge handling and return a 200, making
+    // the purchase look "already paid" when it did not happen.
+    'X-Plan-Probe': '1',
   };
   if (paymentMethod === 'lift') {
     extraHeaders['X-Payment-Method'] = 'lift';
@@ -512,7 +518,9 @@ async function buyPlan(args) {
     const discountPercent = await getLiftDiscountPercent();
     if (discountPercent > 0) {
       const discountSats = Math.round(priceSats * (discountPercent / 100));
-      lines.push('**LIFT discount applied: ' + discountPercent + '% — you saved ' + formatBch(discountSats) + ' BCH.**');
+      const discountUsd = typeof tier.price_usd === 'number' ? (tier.price_usd * (discountPercent / 100)).toFixed(2) : null;
+      const usdMsg = discountUsd ? ' (saved $' + discountUsd + ')' : '';
+      lines.push('**LIFT discount applied: ' + discountPercent + '% — you saved ' + formatBch(discountSats) + ' BCH.**' + usdMsg);
     } else {
       lines.push('Paid with LIFT tokens.');
     }
@@ -704,10 +712,10 @@ const TOOLS = [
   },
   {
     name: 'buy_plan',
-    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. IMPORTANT RESTRICTION: a plan CANNOT be purchased while the model still has active credits — the backend serves requests without payment once credits are active, so buying again charges nothing and does not stack time. Before calling, check the model\\'s credits with get_credits; if the model still has time remaining, do NOT buy — tell the user to use up or wait out the remaining credits first. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens. Paying with LIFT gets a discount (rate set server-side; see get_help or get_plans for the current percent).',
+    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. IMPORTANT — QUESTION FLOW: When the user types "buy_plan" without specifying model/duration/payment, ask three SEPARATE questions via the question tool, one per call, in this order. NEVER combine model and duration into one question — each question covers exactly one dimension. Step 1 — question header "Model": options = one per available model (label = display name e.g. "GLM 5.3 Flash (Budget)", description = its tiers e.g. "15 min $0.40 · 30 min $0.64 · 60 min $1.11"). Step 2 — question header "Duration": options = ONLY the chosen model\'s tiers (label = minutes e.g. "15 min", description = exact price e.g. "$0.40 / 0.00160 BCH"). Step 3 — question header "Payment": options = "BCH" (default) and "LIFT (10% discount)". After all three answers, call buy_plan with model=<chosen id>, minutes=<chosen duration>, payment_method=<bch|lift>. IMPORTANT RESTRICTION: a plan CANNOT be purchased while the model still has active credits — the backend serves requests without payment once credits are active, so buying again charges nothing and does not stack time. Before calling, check the model\'s credits with get_credits; if the model still has time remaining, do NOT buy — tell the user to use up or wait out the remaining credits first. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens. Paying with LIFT gets a discount (rate set server-side; see get_help or get_plans for the current percent).',
     inputSchema: {
       type: 'object',
-      required: ['model', 'minutes'],
+      required: ['model', 'minutes', 'payment_method'],
       properties: {
         model: { type: 'string', description: 'Model id or display name, e.g. deepseek/deepseek-v4-flash or DeepSeek V4 Flash.' },
         minutes: { type: 'number', description: 'Plan duration in minutes, e.g. 30 for the 30-minute tier.' },
