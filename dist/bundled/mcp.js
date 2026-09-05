@@ -439,10 +439,15 @@ async function buyPlan(args) {
 
   // Minimal chat request for the target model; the payment flow only needs a
   // valid request that triggers the x402 PaymentRequired for that model.
+  // max_tokens is kept tiny so the post-payment retry (same body + payment
+  // signature) returns in seconds instead of generating a full response — the
+  // opencode MCP client times out tool calls (~60s default) before a long
+  // non-streaming generation would finish.
   const body = JSON.stringify({
     model: model.id,
-    messages: [{ role: 'user', content: 'Purchase plan' }],
+    messages: [{ role: 'user', content: 'ok' }],
     stream: false,
+    max_tokens: 1,
   });
 
   const url = BACKEND_URL + '/v1/chat/completions?wallet_hash=' + encodeURIComponent(WALLET_HASH || '');
