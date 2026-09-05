@@ -4,11 +4,13 @@ import { startProxy, getPaytacaCommand } from './proxy';
 import { MCP_SERVER_CONTENT } from './bundled/mcp';
 import { filterProxyChatter } from './context';
 import { runSelfHeal } from './selfheal';
+import { createCreditsToastWatch } from './credits';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-async function OpencodePlugin(_input?: any, _options?: any) {
+async function OpencodePlugin(input?: any, _options?: any) {
+  const client = input?.client;
   const configDir = getConfigDir();
   ensureConfigDir(configDir);
 
@@ -92,6 +94,17 @@ async function OpencodePlugin(_input?: any, _options?: any) {
 
   // Start or reuse proxy
   const proxy = await startProxy(configDir, config);
+
+  // Credits → TUI toasts: warn when time runs low/exhausted and celebrate
+  // refills. Runs once shortly after startup and then after each idle session.
+  const creditsToaster = createCreditsToastWatch({
+    client,
+    backendUrl: () => config.backendUrl || '',
+    walletHash: () => cachedWalletHash,
+  });
+  setTimeout(() => {
+    void creditsToaster.check();
+  }, 4000);
 
   // Write the MCP server script so opencode can spawn it (registered in the
   // config hook below). It exposes read-only account tools (credits, balance,
@@ -219,7 +232,21 @@ async function OpencodePlugin(_input?: any, _options?: any) {
       if (permissions['paytaca_buy_plan'] === undefined) {
         permissions['paytaca_buy_plan'] = 'ask';
       }
+      if (permissions['paytaca_auto_refill'] === undefined) {
+        permissions['paytaca_auto_refill'] = 'ask';
+      }
       cfg.permission = permissions as typeof cfg.permission;
+    },
+    event: async (eventInput: any) => {
+      // Re-check credits whenever a session finishes a turn, so the user is
+      // nudged as soon as time runs low — or when a refill lands.
+      try {
+        if (eventInput?.event?.type === 'session.idle') {
+          await creditsToaster.check();
+        }
+      } catch (e: any) {
+        console.error('Credits toast check failed:', e.message);
+      }
     },
     "chat.headers": async (_input: any, output: any) => {
       // Secondary fallback delivery path. Never send an empty value —

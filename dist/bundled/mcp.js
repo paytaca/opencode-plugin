@@ -136,7 +136,7 @@ function runCommand(cmd, args, timeoutMs) {
               message = (parsed && parsed.error) || message;
             } catch (e) {}
           } else if (errText && stdout.trim()) {
-            message = errText + '\n' + stdout.trim();
+            message = errText + '\\n' + stdout.trim();
           }
         }
         reject(new Error(message));
@@ -173,6 +173,7 @@ const FAQ = [
   ['How do I buy a plan?', 'Three steps: (1) make sure your wallet has funds — get_receiving_address to deposit, get_balance to confirm; (2) see pricing with get_plans; (3) ask to buy, e.g. "Buy a DeepSeek V4 Flash plan for 30 minutes." opencode will ask you to approve the payment.'],
   ['Can I pay with LIFT tokens?', 'Yes. Plans can be paid in BCH or LIFT tokens. To pay with tokens, add "pay with LIFT" to your buy request, e.g. "Buy a 15-minute GLM plan and pay with LIFT." Paying with LIFT applies a discount — see the current rate below (the backend sets it, so it can change anytime).'],
   ['Why can\\'t I buy again while I still have credits?', 'Plans are time blocks, not balances that stack. While a model still has active time, buying another plan for it would charge nothing extra. Use up or wait out the remaining credits, then buy again. Check remaining time with get_credits.'],
+  ['Can the plugin keep buying plans automatically during a long task?', 'Yes. Tell the assistant something like "auto-refill the DeepSeek plan at 15 minutes, max 2 hours" or "keep buying 15-minute plans until I stop it". It arms auto-refill; from then on, whenever credits run out mid-task it silently buys another plan and continues without interrupting you. It stops when the cap is reached, the wallet runs short, or you tell it to stop. Each refill is a real wallet payment (opencode asks you to approve the auto-refill tool once when arming).'],
   ['What is Bitcoin Cash (BCH)?', 'Bitcoin Cash is peer-to-peer electronic cash. Transactions are confirmed in seconds to minutes with extremely low fees (fractions of a cent), which makes it practical for small, everyday payments like buying a plan. It is the currency Paytaca AI payments run on.'],
   ['What are CashTokens and LIFT?', 'CashTokens are fungible and non-fungible tokens issued on the Bitcoin Cash blockchain. LIFT is a Paytaca CashToken you can use to pay for AI plans, and it can be bought/sold for BCH on the Cauldron DEX.'],
   ['What is Paytaca?', 'Paytaca is a Bitcoin Cash wallet and payments ecosystem, and Paytaca AI is its AI inference service. The Paytaca wallet app holds your BCH and CashTokens, and Paytaca AI lets you spend them on AI usage.'],
@@ -522,6 +523,85 @@ async function buyPlan(args) {
   return lines.join('\\n');
 }
 
+// Arm/disarm automatic plan refills for the current session. When armed, the
+// proxy (which sits in front of the AI backend) silently buys another plan of
+// the configured size every time the model's credits run out mid-request and
+// retries, instead of pausing for the interactive tier-selection prompt. It
+// stops automatically once the cumulative max_minutes budget is reached. State
+// lives in ~/.opencode-paytaca/auto-refill.json, shared with the proxy.
+const AUTO_REFILL_FILE = path.join(CONFIG_DIR, 'auto-refill.json');
+
+async function setAutoRefill(args) {
+  const enabled = args.enabled === true;
+  const stateFile = AUTO_REFILL_FILE;
+
+  const readState = () => {
+    try {
+      return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    } catch (e) {
+      return null;
+    }
+  };
+  const prev = readState();
+
+  if (!enabled) {
+    const spent = (prev && prev.spentMinutes) ? Number(prev.spentMinutes) : 0;
+    fs.writeFileSync(stateFile, JSON.stringify(Object.assign({}, prev || {}, { enabled: false }), null, 2), 'utf8');
+    if (prev && prev.enabled) {
+      return 'Auto-refill is now OFF. It purchased ' + spent + ' minutes before being stopped.';
+    }
+    return 'Auto-refill is already off. Nothing changed.';
+  }
+
+  const modelFilter = String(args.model || '').trim();
+  if (!modelFilter) {
+    throw new Error('Missing model. Pass the model id or display name to auto-refill, e.g. deepseek/deepseek-v4-flash.');
+  }
+  const minutes = Number(args.minutes);
+  if (isNaN(minutes) || minutes <= 0) {
+    throw new Error('Missing or invalid minutes. Pass the plan size to buy on each refill, e.g. 15.');
+  }
+  const maxMinutes = Number(args.max_minutes);
+  if (isNaN(maxMinutes) || maxMinutes < minutes) {
+    throw new Error('Missing or invalid max_minutes. It caps total auto-bought minutes and must be at least the plan size (' + minutes + '). E.g. 120 for 2 hours.');
+  }
+  const paymentMethod = args.payment_method === 'lift' ? 'lift' : 'bch';
+
+  const { model, tier } = await resolvePlan(modelFilter, minutes);
+  const priceSats = Number(tier.price_sats) || 0;
+  const perRefillBch = (priceSats / 100000000).toFixed(8);
+  const refillCount = Math.max(1, Math.ceil(maxMinutes / minutes));
+  const maxCostBch = (priceSats * refillCount / 100000000).toFixed(8);
+
+  const state = {
+    enabled: true,
+    minutes: minutes,
+    maxMinutes: maxMinutes,
+    spentMinutes: 0,
+    model: model.id,
+    paymentMethod: paymentMethod,
+    startedAt: new Date().toISOString(),
+    lastRefillAt: null,
+  };
+  try {
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf8');
+  } catch (e) {
+    throw new Error('Failed to save auto-refill state: ' + e.message);
+  }
+
+  const paidWith = paymentMethod === 'lift' ? 'LIFT tokens' : 'BCH';
+  const lines = [
+    'Auto-refill is now ARMED for ' + (model.display_name || model.id) + '.',
+    '',
+    '- Refill: when credits run out, the plugin buys another ' + minutes + '-minute plan (' + perRefillBch + ' BCH, paid with ' + paidWith + ') automatically and keeps working.',
+    '- Cap: up to ' + maxMinutes + ' total minutes (' + refillCount + ' refills, max ' + maxCostBch + ' BCH). Auto-refill turns itself off once the cap is reached or when you stop it (auto_refill with enabled=false).',
+    '- It also stops automatically if the wallet runs out of funds or if no refill happens for 24 hours.',
+    '',
+    'Continue the task — the next time credits run out, the plugin resumes by itself.',
+  ];
+  return lines.join('\\n');
+}
+
 // Recent wallet transactions via the paytaca CLI
 async function getTransactions(args) {
   const cmdArgs = ['history'];
@@ -628,6 +708,21 @@ const TOOLS = [
     },
   },
   {
+    name: 'auto_refill',
+    description: 'Arm (or disarm) automatic plan refills. When armed, if the model\\'s credits run out mid-task, the plugin silently buys another plan of the chosen size and continues working without the interactive buy prompt, up to a cap. Use when the user wants an uninterrupted long session, e.g. "keep buying 15-minute plans until the task is done, max 2 hours" or "auto-refill the plan when credits run out". Call with enabled=true plus model, minutes (plan size per refill) and max_minutes (cap on total auto-bought minutes; e.g. 120 for 2 hours). Each refill is a real wallet payment. Call with enabled=false to stop early. After arming, tell the user to keep working.',
+    inputSchema: {
+      type: 'object',
+      required: ['enabled'],
+      properties: {
+        enabled: { type: 'boolean', description: 'Arm (true) or disarm (false) automatic refills.' },
+        model: { type: 'string', description: 'Model id or display name to auto-refill (required when enabling), e.g. deepseek/deepseek-v4-flash.' },
+        minutes: { type: 'number', description: 'Plan size in minutes bought per refill (required when enabling), e.g. 15.' },
+        max_minutes: { type: 'number', description: 'Maximum total minutes to auto-buy across all refills (required when enabling), e.g. 120 for a 2-hour cap.' },
+        payment_method: { type: 'string', enum: ['bch', 'lift'], description: 'Payment method for each refill. Default bch. Set to lift when the user wants to pay with LIFT tokens (discount applies).' },
+      },
+    },
+  },
+  {
     name: 'get_transactions',
     description: 'Get recent Paytaca wallet transactions (sent/received BCH). Use when the user asks about transaction history or latest transactions.',
     inputSchema: {
@@ -711,6 +806,7 @@ function handleMessage(msg) {
           case 'get_models': text = await getModels(); break;
           case 'get_plans': text = await getPlans(args.model); break;
           case 'buy_plan': text = await buyPlan(args); break;
+          case 'auto_refill': text = await setAutoRefill(args); break;
           case 'get_transactions': text = await getTransactions(args); break;
           case 'get_receiving_address': text = await getReceivingAddress(args); break;
           case 'get_tokens': text = await getTokens(args); break;

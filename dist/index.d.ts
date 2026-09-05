@@ -1,9 +1,11 @@
-declare function OpencodePlugin(_input?: any, _options?: any): Promise<{
+declare function OpencodePlugin(input?: any, _options?: any): Promise<{
     config?: undefined;
+    event?: undefined;
     "chat.headers"?: undefined;
     "experimental.chat.messages.transform"?: undefined;
 } | {
     config: (cfg: any) => Promise<void>;
+    event: (eventInput: any) => Promise<void>;
     "chat.headers": (_input: any, output: any) => Promise<void>;
     "experimental.chat.messages.transform": (_input: any, output: any) => Promise<void>;
 }>;

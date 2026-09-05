@@ -38,10 +38,12 @@ const proxy_1 = require("./proxy");
 const mcp_1 = require("./bundled/mcp");
 const context_1 = require("./context");
 const selfheal_1 = require("./selfheal");
+const credits_1 = require("./credits");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const os = __importStar(require("os"));
-async function OpencodePlugin(_input, _options) {
+async function OpencodePlugin(input, _options) {
+    const client = input?.client;
     const configDir = (0, config_1.getConfigDir)();
     (0, config_1.ensureConfigDir)(configDir);
     let config = (0, config_1.loadConfig)(configDir);
@@ -118,6 +120,16 @@ async function OpencodePlugin(_input, _options) {
     }
     // Start or reuse proxy
     const proxy = await (0, proxy_1.startProxy)(configDir, config);
+    // Credits → TUI toasts: warn when time runs low/exhausted and celebrate
+    // refills. Runs once shortly after startup and then after each idle session.
+    const creditsToaster = (0, credits_1.createCreditsToastWatch)({
+        client,
+        backendUrl: () => config.backendUrl || '',
+        walletHash: () => cachedWalletHash,
+    });
+    setTimeout(() => {
+        void creditsToaster.check();
+    }, 4000);
     // Write the MCP server script so opencode can spawn it (registered in the
     // config hook below). It exposes read-only account tools (credits, balance,
     // models, plans) so the assistant can answer account questions directly.
@@ -239,7 +251,22 @@ async function OpencodePlugin(_input, _options) {
             if (permissions['paytaca_buy_plan'] === undefined) {
                 permissions['paytaca_buy_plan'] = 'ask';
             }
+            if (permissions['paytaca_auto_refill'] === undefined) {
+                permissions['paytaca_auto_refill'] = 'ask';
+            }
             cfg.permission = permissions;
+        },
+        event: async (eventInput) => {
+            // Re-check credits whenever a session finishes a turn, so the user is
+            // nudged as soon as time runs low — or when a refill lands.
+            try {
+                if (eventInput?.event?.type === 'session.idle') {
+                    await creditsToaster.check();
+                }
+            }
+            catch (e) {
+                console.error('Credits toast check failed:', e.message);
+            }
         },
         "chat.headers": async (_input, output) => {
             // Secondary fallback delivery path. Never send an empty value —

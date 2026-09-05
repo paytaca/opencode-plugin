@@ -113,13 +113,30 @@ const LIFT_TOKEN_ID = '5932b2fd4915d6a75d3ec53282cd49118149a2176ee67ed68b1111ff0
 async function getLiftBalance() {
   try {
     const output = await runCommand(PAYTACA_CMD, ['token', 'info', LIFT_TOKEN_ID]);
-    const match = output.match(/Balance:\\s*([\\d.]+)\\s*LIFT/i);
+    const match = output.match(/Balance:\s*([\d.]+)\s*LIFT/i);
     if (match) return Math.round(parseFloat(match[1]) * 100);
     return null;
   } catch (err) {
     log('Failed to get LIFT balance: ' + err.message);
     return null;
   }
+}
+
+// Short-lived cache of wallet + LIFT balances so we don't shell out to the CLI
+// on every forwarded prompt. The backend concierge reads these headers to give
+// free balance answers when the wallet has no paid capacity.
+const BALANCE_CACHE_TTL = 15000;
+let balanceCache = { at: 0, sats: null, lift: null };
+
+async function getCachedBalances() {
+  const now = Date.now();
+  if (balanceCache.at && now - balanceCache.at < BALANCE_CACHE_TTL) {
+    return { sats: balanceCache.sats, lift: balanceCache.lift };
+  }
+  const sats = await getWalletBalance();
+  const lift = await getLiftBalance();
+  balanceCache = { at: now, sats, lift };
+  return { sats, lift };
 }
 
 // LIFT payment discount percent advertised by the backend (/v1/config), cached
@@ -379,7 +396,8 @@ async function streamLowBalanceNotice(res, modelName, otherModels) {
 }
 
 // Forward request to Django and return response (buffered, for non-streaming)
-function forwardToDjango(req, body, callback) {
+async function forwardToDjango(req, body, callback) {
+  const balances = await getCachedBalances();
   const options = {
     hostname: DJANGO_HOST,
     port: DJANGO_PORT,
@@ -388,6 +406,8 @@ function forwardToDjango(req, body, callback) {
     headers: {
       'Content-Type': req.headers['content-type'] || 'application/json',
       'X-Wallet-Hash': req.headers['x-wallet-hash'] || '',
+      'X-Wallet-Balance-Sats': balances.sats !== null ? String(balances.sats) : '',
+      'X-Lift-Balance-Units': balances.lift !== null ? String(balances.lift) : '',
       'Content-Length': Buffer.byteLength(body),
     },
   };
@@ -431,7 +451,8 @@ function forwardToDjango(req, body, callback) {
 }
 
 // Forward streaming request to Django
-function forwardStreaming(req, res, body, callback) {
+async function forwardStreaming(req, res, body, callback) {
+  const balances = await getCachedBalances();
   const options = {
     hostname: DJANGO_HOST,
     port: DJANGO_PORT,
@@ -440,6 +461,8 @@ function forwardStreaming(req, res, body, callback) {
     headers: {
       'Content-Type': req.headers['content-type'] || 'application/json',
       'X-Wallet-Hash': req.headers['x-wallet-hash'] || '',
+      'X-Wallet-Balance-Sats': balances.sats !== null ? String(balances.sats) : '',
+      'X-Lift-Balance-Units': balances.lift !== null ? String(balances.lift) : '',
       'Content-Length': Buffer.byteLength(body),
     },
   };
@@ -861,6 +884,184 @@ function runPaytacaPay(djangoUrl, body, walletHash, extraHeaders, paymentMethod,
       fs.rmdirSync(tmpDir);
     } catch {}
     callback(new Error('Failed to run paytaca pay wrapper: ' + err.message));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Auto-refill: when armed via the MCP auto_refill tool, the proxy silently buys
+// a plan of the configured size on 402 (credits exhausted) and retries instead
+// of showing the interactive tier prompt. It stops when the cumulative budget
+// (maxMinutes) is reached, the requested model mismatches, funds are short, or
+// 24h pass without a refill (so a stale armed state cannot keep spending in a
+// later session).
+const AUTO_REFILL_FILE = path.join(LOG_DIR, 'auto-refill.json');
+
+function getAutoRefillState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(AUTO_REFILL_FILE, 'utf8'));
+    if (!s || s.enabled !== true) {
+      return null;
+    }
+    return {
+      enabled: true,
+      minutes: Number(s.minutes) || 0,
+      maxMinutes: Number(s.maxMinutes) || 0,
+      spentMinutes: Number(s.spentMinutes) || 0,
+      model: s.model ? String(s.model) : '',
+      paymentMethod: s.paymentMethod === 'lift' ? 'lift' : 'bch',
+      startedAt: s.startedAt || new Date().toISOString(),
+      lastRefillAt: s.lastRefillAt || null,
+    };
+  } catch (err) {
+    log('Failed to read auto-refill state: ' + err.message);
+    return null;
+  }
+}
+
+function saveAutoRefillState(s) {
+  try {
+    fs.writeFileSync(AUTO_REFILL_FILE, JSON.stringify(s, null, 2), 'utf8');
+  } catch (err) {
+    log('Failed to write auto-refill state: ' + err.message);
+  }
+}
+
+// Can the proxy buy another plan right now? Handles budget, model scope and a
+// staleness rule — when it returns false the caller falls through to the normal
+// interactive tier prompt so the user can buy manually.
+function autoRefillCanBuy(s, modelId) {
+  if (!s || !s.enabled) return false;
+  if (s.minutes <= 0 || s.maxMinutes < s.minutes) {
+    log('Auto-refill disarmed: bad config (minutes=' + s.minutes + ' maxMinutes=' + s.maxMinutes + ')');
+    s.enabled = false;
+    saveAutoRefillState(s);
+    return false;
+  }
+  if (s.spentMinutes >= s.maxMinutes) {
+    return false;
+  }
+  if (s.model && (!modelId || s.model !== modelId)) {
+    return false;
+  }
+  const now = Date.now();
+  const anchorMs = new Date(s.lastRefillAt || s.startedAt || now).getTime();
+  if (isNaN(anchorMs) || now - anchorMs > 24 * 3600 * 1000) {
+    log('Auto-refill disarmed: stale (no refill for 24h)');
+    s.enabled = false;
+    saveAutoRefillState(s);
+    return false;
+  }
+  return true;
+}
+
+// Buy the configured plan automatically and retry the request. Mirrors the
+// interactive payment path (keepalive + paytaca pay + SSE delivery) but never
+// asks the user to pick a tier. On failure it disarms auto-refill and streams
+// the payment-error prompt so the user can retry by hand.
+async function autoRefillAndRetry(res, walletHash, pendingPayload, refill) {
+  log('AUTO-REFILL: buying ' + refill.minutes + '-min plan for wallet ' + walletHash?.substring(0, 16) + '...');
+  pendingPayload.step = 'processing';
+  const extraHeaders = {};
+  if (pendingPayload.modelId) {
+    extraHeaders['X-Model-Id'] = pendingPayload.modelId;
+  }
+  extraHeaders['X-Duration-Minutes'] = String(refill.minutes);
+  if (refill.paymentMethod === 'lift') {
+    extraHeaders['X-Payment-Method'] = 'lift';
+  }
+
+  if (!res.headersSent) {
+    try {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Payment-Processing': 'true',
+      });
+    } catch (e) {
+      log('autoRefillAndRetry writeHead failed: ' + e.message);
+    }
+  }
+  const keepalive = setInterval(() => {
+    if (res.destroyed || res.writableEnded) { clearInterval(keepalive); return; }
+    res.write(': keepalive\\n\\n');
+  }, 2000);
+
+  runPaytacaPay(BACKEND_URL + '/v1', pendingPayload.body, walletHash, extraHeaders, refill.paymentMethod || 'bch', async (err, responseJson) => {
+    clearInterval(keepalive);
+    pendingPayments.delete(walletHash);
+
+    const disarmAndFail = async (msg) => {
+      refill.enabled = false;
+      saveAutoRefillState(refill);
+      log('AUTO-REFILL: failed (' + msg + ') — disarmed');
+      if (res.headersSent && !res.destroyed && !res.writableEnded) {
+        await streamPaymentFailureAndRetry(res, walletHash, pendingPayload, '\\n\\n❌ Auto-refill payment failed: ' + msg + '\\n\\n');
+      } else if (!res.headersSent) {
+        try {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Payment failed', message: msg }));
+        } catch (e) { log('Failed to write auto-refill error JSON: ' + e.message); }
+      } else {
+        log('Cannot send auto-refill failure — response already ended or destroyed');
+      }
+    };
+
+    if (err) {
+      return await disarmAndFail(err.message);
+    }
+    if (!responseJson.success) {
+      const msg = responseJson.timeout
+        ? 'response timed out after payment — check credits with \\'credits\\' and retry'
+        : (responseJson.error || 'Unknown payment error');
+      return await disarmAndFail(msg);
+    }
+
+    // Payment succeeded — count it toward the budget.
+    const spent = Math.min(refill.spentMinutes + refill.minutes, refill.maxMinutes);
+    const exhausted = spent >= refill.maxMinutes;
+    refill.spentMinutes = spent;
+    refill.lastRefillAt = new Date().toISOString();
+    if (exhausted) {
+      refill.enabled = false;
+    }
+    saveAutoRefillState(refill);
+
+    const chatCompletion = responseJson?.data || responseJson;
+    let wasStreaming = false;
+    try {
+      wasStreaming = JSON.parse(pendingPayload.body).stream === true;
+    } catch (e) {}
+
+    log('AUTO-REFILL: payment ok, spent=' + spent + ' min, exhausted=' + exhausted);
+
+    if (res.destroyed || res.writableEnded) {
+      log('Auto-refill payment succeeded but response connection is gone — cannot deliver chat response');
+      return;
+    }
+
+    let note = '⚡ Auto-refill active: bought a ' + refill.minutes + '-minute plan for ' + (pendingPayload.displayName || pendingPayload.modelId || 'this model') + ' (' + spent + '/' + refill.maxMinutes + ' min budget used)';
+    if (exhausted) {
+      note += ' — **budget reached, auto-refill is now OFF**. Reply to buy more manually if you need to keep going.';
+    }
+    note += '. Generating your response...\\n\\n';
+
+    if (wasStreaming) {
+      try {
+        jsonToSse(res, chatCompletion, { prependContent: PROXY_MARKER + '\\n' + note });
+      } catch (e) {
+        log('auto-refill jsonToSse threw: ' + e.message);
+      }
+    } else {
+      try {
+        if (!res.headersSent) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+        }
+        res.end(JSON.stringify(chatCompletion));
+      } catch (e) {
+        log('auto-refill non-stream send failed: ' + e.message);
+      }
+    }
   });
 }
 
@@ -1633,6 +1834,42 @@ const server = http.createServer(async (req, res) => {
           });
           
           if (tiers && tiers.length > 0) {
+            // AUTO-REFILL: when armed, buy the configured plan and retry the
+            // request without the interactive tier prompt. Falls through to the
+            // prompt when not armed, model mismatched, budget exhausted, plan
+            // no longer offered, or the wallet cannot fund the refill.
+            const refill = getAutoRefillState();
+            if (refill && autoRefillCanBuy(refill, modelId || requestModel)) {
+              const refillTier = (tiers || []).find((t) => Number(t.minutes) === Number(refill.minutes));
+              if (refillTier && refillTier.price_sats) {
+                if (refill.paymentMethod !== 'lift') {
+                  const currentBalanceSats = await getWalletBalance();
+                  if (currentBalanceSats === null || currentBalanceSats >= Number(refillTier.price_sats)) {
+                    const pp = pendingPayments.get(walletHash);
+                    await autoRefillAndRetry(res, walletHash, pp, refill);
+                    return;
+                  }
+                  log('AUTO-REFILL: insufficient balance (' + (currentBalanceSats === null ? 'n/a' : currentBalanceSats) + ' sats < ' + refillTier.price_sats + ') — disarming');
+                  refill.enabled = false;
+                  saveAutoRefillState(refill);
+                } else {
+                  const liftUnits = await getLiftBalance();
+                  if (liftUnits !== null && liftUnits > 0) {
+                    const pp = pendingPayments.get(walletHash);
+                    await autoRefillAndRetry(res, walletHash, pp, refill);
+                    return;
+                  }
+                  log('AUTO-REFILL: no LIFT tokens — disarming');
+                  refill.enabled = false;
+                  saveAutoRefillState(refill);
+                }
+              } else {
+                log('AUTO-REFILL: configured ' + refill.minutes + '-min plan not offered — disarming');
+                refill.enabled = false;
+                saveAutoRefillState(refill);
+              }
+            }
+
             // New flow: show tier selection prompt. Also tell the user about
             // other models that still have paid credits, so they can switch
             // instead of buying a plan for the currently selected model.
@@ -1726,9 +1963,9 @@ const server = http.createServer(async (req, res) => {
       };
 
       if (isStreaming) {
-        forwardStreaming(req, res, body, handleResponse);
+        await forwardStreaming(req, res, body, handleResponse);
       } else {
-        forwardToDjango(req, body, handleResponse);
+        await forwardToDjango(req, body, handleResponse);
       }
       
     } catch (err) {

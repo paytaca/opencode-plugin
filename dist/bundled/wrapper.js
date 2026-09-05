@@ -20,6 +20,78 @@ import { dirname, join } from 'path';
 // complete; override with PAYTACA_PAY_TIMEOUT_MS.
 const PAY_TIMEOUT_MS = Number(process.env.PAYTACA_PAY_TIMEOUT_MS || 240000);
 
+// Pre-payment stability probe. Before broadcasting the payment we sample the
+// plan/config endpoint several times ~500ms apart to catch a "flapping"
+// backend (reachable one moment, unreachable the next, e.g. right after a
+// purchase). If any sample fails while others succeed, or the plan price
+// changes between samples, we abort BEFORE any money moves. Disable with
+// PAYTACA_PLAN_PROBE=0.
+const PLAN_PROBE_ENABLED = process.env.PAYTACA_PLAN_PROBE !== '0';
+const PLAN_PROBE_SAMPLES = 3;
+const PLAN_PROBE_SPACING_MS = 500;
+const PLAN_PROBE_TIMEOUT_MS = 6000;
+
+function planProbeSleep(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// Probe /v1/config (models + price tiers) repeatedly. Throws when the endpoint
+// is flapping or the plan price changes between samples. Returns undefined on
+// a stable backend.
+async function probePlanStability(url, headers) {
+  const modelId = headers['X-Model-Id'];
+  const minutes = headers['X-Duration-Minutes'];
+  if (!modelId || !minutes) return;
+  let origin = null;
+  try { origin = new URL(url).origin; } catch (e) { return; }
+  if (!origin) return;
+
+  let okSamples = 0;
+  let totalSamples = 0;
+  const priceSamples = [];
+  let lastError = '';
+
+  for (let i = 0; i < PLAN_PROBE_SAMPLES; i++) {
+    totalSamples++;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(function () { controller.abort(); }, PLAN_PROBE_TIMEOUT_MS);
+      let res;
+      try {
+        res = await fetch(origin + '/v1/config', { signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) { lastError = 'HTTP ' + res.status; continue; }
+      const data = await res.json();
+      const models = Array.isArray(data.models) ? data.models : [];
+      const model = models.find(function (m) {
+        const id = String(m.id || '').toLowerCase();
+        const name = String(m.display_name || '').toLowerCase();
+        const q = String(modelId).toLowerCase();
+        return id.indexOf(q) !== -1 || name.indexOf(q) !== -1;
+      });
+      if (!model) { lastError = 'model ' + modelId + ' not in plan config'; continue; }
+      const tiers = Array.isArray(model.price_tiers) ? model.price_tiers : [];
+      const tier = tiers.find(function (t) { return Number(t.minutes) === Number(minutes); });
+      if (!tier) { lastError = 'no ' + minutes + '-min plan for ' + modelId + ' in plan config'; continue; }
+      priceSamples.push(Number(tier.price_sats) || 0);
+      okSamples++;
+    } catch (e) {
+      lastError = (e && e.name === 'AbortError') ? 'timeout' : (e && e.message) || String(e);
+    }
+    if (i < PLAN_PROBE_SAMPLES - 1) await planProbeSleep(PLAN_PROBE_SPACING_MS);
+  }
+
+  // Stable = every sample succeeded AND every sample quoted the same price.
+  if (okSamples === totalSamples && priceSamples.length > 0) {
+    const first = priceSamples[0];
+    const allEqual = priceSamples.every(function (p) { return p === first; });
+    if (allEqual) return;
+  }
+  throw new Error('Backend plan endpoint looked unstable before purchase (reachable ' + okSamples + '/' + totalSamples + (lastError ? ', last error: ' + lastError : '') + '). No payment was broadcast — please retry in a few seconds.');
+}
+
 // Find paytaca-cli installation
 function findPaytacaCliPath() {
   const possiblePaths = [];
@@ -165,6 +237,9 @@ async function main() {
   const x402Payer = new X402Payer({ hdWallet, addressIndex: 0 });
 
   try {
+    if (PLAN_PROBE_ENABLED) {
+      await probePlanStability(url, headers);
+    }
     const result = await executePay(url, method, headers, body, bchWallet, hdWallet, x402Payer, isChipnet, confirmed, paymentMethod);
     console.log(JSON.stringify(result, null, 2));
   } catch (err) {
