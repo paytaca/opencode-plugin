@@ -51,11 +51,13 @@ The assistant answers using live data via these tools:
 
 | Tool | Description |
 |---|---|
+| `get_help` | Q&A guide on the wallet, funding, plans, paying with BCH or LIFT, and more |
 | `get_credits` | Remaining time credits per active model session |
 | `get_balance` | BCH balance of the Paytaca wallet |
 | `get_models` | Available models (id, display name, tier) |
 | `get_plans` | Plan pricing grouped by tier (minutes, USD, BCH) |
-| `buy_plan` | Buy time credits for any model + plan duration (spends BCH) |
+| `buy_plan` | Buy time credits for any model + plan duration (spends BCH or LIFT) |
+| `auto_refill` | Arm/disarm automatic plan refills so long sessions never stall |
 | `get_transactions` | Recent wallet transactions (filter by direction, page) |
 | `get_receiving_address` | Receiving address, optionally as a BIP21 URI with amount |
 | `get_tokens` | CashToken holdings, or details for one token category |
@@ -68,6 +70,33 @@ shows pricing with `get_plans`, then purchases via `buy_plan`, which runs the
 same x402 payment flow as the interactive proxy prompt. Because this spends
 real funds, opencode always asks for approval before the tool runs (the plugin
 sets the `paytaca_buy_plan` permission to `ask`).
+
+Plans can be paid with **BCH** (default) or with **LIFT tokens** — say "pay with
+LIFT" or "pay with my LIFT tokens" and the tool sells your LIFT balance via
+Cauldron to fund the plan. LIFT payments get a discount (rate set server-side;
+the assistant can quote the current percent via `get_help` or `get_plans`).
+You can't buy a plan while the model still has active credits — spending would
+charge nothing and time doesn't stack, so use up or wait out remaining credits
+before buying again.
+
+### Auto-refilling a plan
+
+For uninterrupted long sessions ("keep buying 15-minute plans until the task is
+done, max 2 hours"), the assistant can arm `auto_refill`. When the model's
+credits run out mid-task, the plugin then silently buys another plan of the
+chosen size and keeps working — no interactive prompt — until either the task
+finishes, `auto_refill` is disarmed, or the total auto-bought minutes reach your
+cap. Each refill is a real wallet payment (BCH, or LIFT when requested), so
+opencode prompts for approval when the tool is armed.
+
+### Free concierge answers
+
+Even with no paid capacity left, balance and "how it works" questions are
+answered for free: the backend runs a lightweight concierge model and, when your
+wallet can't pay, answers questions about your BCH/LIFT balance, models, pricing,
+and how to top up — instead of a bare `402`. Genuine purchases still require
+payment and are never stuck behind the concierge. Accounts with paid capacity
+get the concierge too, but the real model answers as usual.
 
 ### Sending funds
 
