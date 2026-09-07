@@ -169,7 +169,7 @@ const FAQ = [
   ['What makes Paytaca AI different from other AI services?', 'We keep AI access affordable and simple by billing in pre-purchased blocks of time rather than per token. Pick a model, buy a 15/30/60-minute plan with your wallet, and the time is yours to use. No surprises per message, no recurring billing.'],
   ['Did this plugin create a wallet for me?', 'Yes. Installing the Paytaca AI opencode plugin automatically created a Paytaca wallet on this device (a Bitcoin Cash wallet). Any BCH or LIFT tokens you send to its address are available to this plugin to spend.'],
   ['How do I fund my wallet?', 'Get your wallet\\'s receiving address (ask "what\\'s my address?" or call get_receiving_address), then send BCH or LIFT tokens to it from any Bitcoin Cash wallet or exchange. Funding must happen BEFORE you can buy a plan. Check your balance anytime with get_balance.'],
-  ['How do I buy a plan?', 'Three steps: (1) make sure your wallet has funds — get_receiving_address to deposit, get_balance to confirm; (2) see pricing with get_plans; (3) ask to buy, e.g. "Buy a DeepSeek V4 Flash plan for 30 minutes." opencode will ask you to approve the payment.'],
+  ['How do I buy a plan?', 'Three steps: (1) make sure your wallet has funds — get_receiving_address to deposit, get_balance to confirm; (2) see pricing with get_plans; (3) ask to buy, e.g. "Buy 30 minutes of DeepSeek V4 Flash and pay with BCH", or just prompt "buy plan" to be guided through it with questions. opencode will ask you to approve the payment.'],
   ['Can I pay with LIFT tokens?', 'Yes. Plans can be paid in BCH or LIFT tokens. To pay with tokens, add "pay with LIFT" to your buy request, e.g. "Buy a 15-minute GLM plan and pay with LIFT." Paying with LIFT applies a discount — see the current rate below (the backend sets it, so it can change anytime).'],
   ['Why can\\'t I buy again while I still have credits?', 'Plans are time blocks, not balances that stack. While a model still has active time, buying another plan for it would charge nothing extra. Use up or wait out the remaining credits, then buy again. Check remaining time with get_credits.'],
   ['Can the plugin keep buying plans automatically during a long task?', 'Yes. Tell the assistant something like "auto-refill the DeepSeek plan at 15 minutes, max 2 hours" or "keep buying 15-minute plans until I stop it". It arms auto-refill; from then on, whenever credits run out mid-task it silently buys another plan and continues without interrupting you. It stops when the cap is reached, the wallet runs short, or you tell it to stop. Each refill is a real wallet payment (opencode asks you to approve the auto-refill tool once when arming).'],
@@ -184,12 +184,13 @@ const FAQ = [
 async function nextSteps() {
   const percent = await getLiftDiscountPercent();
   const liftLine = percent > 0
-    ? '- Pay with LIFT tokens instead of BCH: just add "pay with LIFT" to your request, e.g. "Buy a 30-minute GLM plan and pay with LIFT." — you get **' + percent + '% off**.'
-    : '- Pay with LIFT tokens instead of BCH: just add "pay with LIFT" to your request, e.g. "Buy a 30-minute GLM plan and pay with LIFT."';
+    ? '- Pay with LIFT instead of BCH for a discount: add "pay with LIFT" to your buy request, e.g. "Buy 30 minutes of GLM 5.3 Flash and pay with LIFT." — you get **' + percent + '% off**.'
+    : '- Pay with LIFT instead of BCH: add "pay with LIFT" to your buy request, e.g. "Buy 30 minutes of GLM 5.3 Flash and pay with LIFT."';
   return [
     '',
     'What would you like to do next?',
-    '- Buy a plan: pick a model and duration from the list above, then say something like: "Buy a DeepSeek V4 Flash plan for 15 minutes."',
+    '- Buy a plan in one go: say something like "Buy 30 minutes of GLM 5.3 Flash and pay with BCH" — swap in any model, duration, and payment method from the list above.',
+    '- Guided purchase: just prompt "buy plan" and a guided purchase with questions will be activated.',
     liftLine,
     '- Check your credits: "How much time do I have left?"',
     '- See prices for another model: "Show me the plans for <model>."',
@@ -229,6 +230,8 @@ async function getCredits() {
   if (parts.length === 0) {
     return 'No active time credits.' + await nextSteps();
   }
+  parts.push('');
+  parts.push('IMPORTANT: In your reply to the user, copy the tables above VERBATIM as markdown tables. Do NOT summarize them into one-line lists — the user cannot see this tool output, only your reply.');
   return parts.join('\\n') + await nextSteps();
 }
 
@@ -242,11 +245,17 @@ async function getHelp() {
   return 'Paytaca AI and your wallet — frequently asked questions:\\n\\n' + FAQ + liftLine + await nextSteps();
 }
 
-// Wallet BCH balance via the paytaca CLI
+// Wallet BCH balance via the paytaca CLI (includes USD conversion added in
+// paytaca-cli wallet info)
 async function getBalance() {
   const out = await runCommand(PAYTACA_CMD, ['wallet', 'info']);
   const match = out.match(/Balance:\\s*([\\d.]+)\\s*BCH/i);
   if (match) {
+    // 0.5.1 prints '≈ N USD' (no '$'); older prints '≈ $N'. Accept both.
+    const usdMatch = out.match(/≈\\s*\\$?([\\d.,]+)\\s*(?:USD)?/i);
+    if (usdMatch) {
+      return 'Wallet balance: ' + match[1] + ' BCH (≈ $' + usdMatch[1] + ').';
+    }
     return 'Wallet balance: ' + match[1] + ' BCH.';
   }
   return 'Could not parse balance. Raw output:\\n' + out.split('\\n').slice(0, 5).join('\\n');
@@ -304,6 +313,8 @@ async function getPlans(filterModel) {
       lines.push('| ' + (t.minutes || 0) + ' min | ' + usd + ' | ' + bch + ' |');
     }
   }
+  lines.push('');
+  lines.push('IMPORTANT: In your reply to the user, copy the pricing tables above VERBATIM as markdown tables. Do NOT summarize them into one-line lists — the user cannot see this tool output, only your reply.');
   return lines.join('\\n') + await nextSteps();
 }
 
@@ -336,7 +347,7 @@ async function resolvePlan(modelFilter, minutes) {
 // Wallet balance in sats (mirrors the proxy's pre-payment check)
 async function getBalanceSats() {
   const out = await runCommand(PAYTACA_CMD, ['wallet', 'info'], 20000);
-  const match = out.match(/Balance:\s*([\d.]+)\s*BCH/i);
+  const match = out.match(/Balance:\\s*([\\d.]+)\\s*BCH/i);
   if (!match) return null;
   return Math.floor(parseFloat(match[1]) * 100000000);
 }
@@ -345,7 +356,7 @@ async function getBalanceSats() {
 // cannot be parsed.
 async function getLiftBalanceUnits() {
   const out = await runCommand(PAYTACA_CMD, ['token', 'info', LIFT_TOKEN_ID], 20000);
-  const match = out.match(/Balance:\s*([\d.]+)\s*LIFT/i);
+  const match = out.match(/Balance:\\s*([\\d.]+)\\s*LIFT/i);
   if (!match) return null;
   return BigInt(Math.round(parseFloat(match[1]) * 100));
 }
@@ -673,7 +684,7 @@ async function sendFunds(args) {
     ? ['token', 'send', address, amount, '--token', tokenCategory]
     : ['send', address, amount];
   if (!tokenCategory && unit === 'sats') {
-    cmdArgs.push('--unit', 'sats');
+    cmdArgs.push('sats');
   }
   log('Send requested: ' + cmdArgs.join(' '));
   const out = await runCommand(PAYTACA_CMD, cmdArgs, 90000);
@@ -715,7 +726,7 @@ const TOOLS = [
   },
   {
     name: 'buy_plan',
-    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. IMPORTANT — QUESTION FLOW: When the user types "buy_plan" without specifying model/duration/payment, ask three SEPARATE questions via the question tool, one per call, in this order. NEVER combine model and duration into one question — each question covers exactly one dimension. Step 1 — question header "Model": options = one per available model (label = display name e.g. "GLM 5.3 Flash (Budget)", description = its tiers e.g. "15 min $0.40 · 30 min $0.64 · 60 min $1.11"). Step 2 — question header "Duration": options = ONLY the chosen model\'s tiers (label = minutes e.g. "15 min", description = exact price e.g. "$0.40 / 0.00160 BCH"). Step 3 — question header "Payment": options = "BCH" (default) and "LIFT (10% discount)". After all three answers, call buy_plan with model=<chosen id>, minutes=<chosen duration>, payment_method=<bch|lift>. IMPORTANT RESTRICTION: a plan CANNOT be purchased while the model still has active credits — the backend serves requests without payment once credits are active, so buying again charges nothing and does not stack time. Before calling, check the model\'s credits with get_credits; if the model still has time remaining, do NOT buy — tell the user to use up or wait out the remaining credits first. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens. Paying with LIFT gets a discount (rate set server-side; see get_help or get_plans for the current percent).',
+    description: 'Purchase Paytaca AI time credits for a specific model and plan duration. SPENDS FUNDS FROM THE WALLET (BCH, or LIFT tokens sold via Cauldron when payment_method=lift) — only call when the user explicitly asks to buy, purchase, or pay for a plan; opencode prompts the user for approval. IMPORTANT — QUESTION FLOW: When the user types "buy_plan" without specifying model/duration/payment, ask three SEPARATE questions via the question tool, one per call, in this order. NEVER combine model and duration into one question — each question covers exactly one dimension. Step 1 — question header "Model": options = one per available model (label = display name e.g. "GLM 5.3 Flash (Budget)", description = its tiers e.g. "15 min $0.40 · 30 min $0.64 · 60 min $1.11"). Step 2 — question header "Duration": options = ONLY the chosen model\\'s tiers (label = minutes e.g. "15 min", description = exact price e.g. "$0.40 / 0.00160 BCH"). Step 3 — question header "Payment": options = "BCH" (default) and "LIFT (10% discount)". After all three answers, call buy_plan with model=<chosen id>, minutes=<chosen duration>, payment_method=<bch|lift>. IMPORTANT RESTRICTION: a plan CANNOT be purchased while the model still has active credits — the backend serves requests without payment once credits are active, so buying again charges nothing and does not stack time. Before calling, check the model\\'s credits with get_credits; if the model still has time remaining, do NOT buy — tell the user to use up or wait out the remaining credits first. Show pricing with get_plans first, then call with the model and minutes the user picked. Works for any model, even one not active in the current session. IMPORTANT — LIFT phrasing: when the user says "pay with LIFT", "pay with LIFT tokens", "use LIFT", or mentions paying a plan with their LIFT token balance, set payment_method to "lift". LIFT is the Paytaca token users hold to pay for AI plans; "pay with LIFT" is NOT asking to buy a plan called LIFT. Default to "bch" unless the user explicitly mentions LIFT/tokens. Paying with LIFT gets a discount (rate set server-side; see get_help or get_plans for the current percent).',
     inputSchema: {
       type: 'object',
       required: ['model', 'minutes', 'payment_method'],
