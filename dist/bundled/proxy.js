@@ -238,7 +238,7 @@ async function streamPaymentRequiredMessage(res, modelName, tiers, otherModels) 
     message += '\\n' + otherModelsHint(otherModels);
   }
   message += '\\nWant to buy one? Say something like "Buy 30 minutes of ' + (modelName || 'this model') + ', pay with BCH" or "pay with LIFT" for 10% off.';
-message += '\\nAlternatively, say something like "buy plan" to trigger the guided purchase flow to select model, plan, and payment method.';
+  message += '\\nAlternatively, say something like "buy plan" to trigger the guided purchase flow to select model, plan, and payment method.';
 
   if (!res.headersSent) {
     res.writeHead(200, {

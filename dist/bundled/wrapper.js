@@ -248,6 +248,55 @@ async function main() {
   }
 }
 
+// Fetch the Paytaca platform fee config from watchtower.cash (GET
+// /api/cauldron-fee/ + BCH price from /api/asset-prices/). Returns null when
+// disabled or unavailable: no address, config fetch failure, or BCH price
+// fetch failure all degrade silently to "no fee charged".
+async function fetchPlatformFee(bchWallet) {
+  try {
+    const api = bchWallet.watchtower.BCH._api;
+    const feeRes = await api.get('cauldron-fee/');
+    const data = feeRes.data || {};
+    const address = typeof data.address === 'string' && data.address !== '' ? data.address : null;
+    if (!address) return null;
+    const priceRes = await api.get('asset-prices/', { params: { assets: 'BCH', vs_currencies: 'USD' } });
+    const prices = (priceRes.data && priceRes.data.prices) || [];
+    let bchUsdPrice = null;
+    for (const p of prices) {
+      if (String(p.currency || '').toLowerCase() !== 'usd') continue;
+      const raw = parseFloat(p.price_value);
+      if (!isFinite(raw) || raw <= 0) continue;
+      bchUsdPrice = raw; // BCH is quoted as fiat per unit (USD per BCH)
+      break;
+    }
+    if (!bchUsdPrice) return null;
+    return {
+      address: address,
+      feeRateBps: Number(data.fee_rate_bps ?? 30),
+      maxUsd: Number(data.max_usd ?? 1),
+      bchUsdPrice: bchUsdPrice,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Compute the Paytaca platform fee for a trade: feeRateBps of the BCH side of
+// the trade (demand minus the DEX trade_fee), capped at max_usd worth of BCH
+// at the current price, and skipped entirely when it lands below 546 sats
+// (P2PKH dust threshold). Returns 0n when no fee applies.
+function computePlatformFeeSats(platformFee, trade) {
+  if (!platformFee || !trade || !trade.summary) return 0n;
+  const tradeSizeSats = BigInt(trade.summary.demand) - BigInt(trade.summary.trade_fee);
+  if (tradeSizeSats <= 0n) return 0n;
+  let feeSats = tradeSizeSats * BigInt(Math.max(0, Math.round(platformFee.feeRateBps))) / 10000n;
+  const capSats = BigInt(Math.floor((platformFee.maxUsd / platformFee.bchUsdPrice) * 1e8));
+  if (capSats <= 0n) return 0n;
+  if (feeSats > capSats) feeSats = capSats;
+  if (feeSats < 546n) return 0n;
+  return feeSats;
+}
+
 // Sell LIFT tokens via Cauldron in a single swap transaction that pays the
 // x402 payTo address directly. Returns { txid, vout } for the payment payload.
 async function payWithLift(bchWallet, hdWallet, requirements, changeAddress) {
@@ -291,20 +340,38 @@ async function payWithLift(bchWallet, hdWallet, requirements, changeAddress) {
   }
 
   const exlab = new ExchangeLab();
-  const payoutRules = [
-    { type: PayoutAmountRuleType.FIXED, locking_bytecode: payToDecoded.bytecode, amount: amountSats },
-    { type: PayoutAmountRuleType.CHANGE, locking_bytecode: changeDecoded.bytecode, allow_mixing_native_and_token: false, allow_mixing_native_and_token_when_bch_change_is_dust: false, add_change_to_txfee_when_bch_change_is_dust: true },
-  ];
+
+  // Paytaca platform fee (distinct from the Cauldron DEX trade fee): a FIXED
+  // payout inserted between the payTo output and change. Disabled silently
+  // when the config, address, or BCH price is unavailable.
+  const platformFee = await fetchPlatformFee(bchWallet);
+  let platformFeeBytecode = null;
+  if (platformFee) {
+    const feeDecoded = cashAddressToLockingBytecode(platformFee.address);
+    if (feeDecoded && typeof feeDecoded !== 'string' && feeDecoded.bytecode) {
+      platformFeeBytecode = feeDecoded.bytecode;
+    }
+  }
 
   // Back-compute the token supply for a demand target slightly above the plan
   // cost so the received BCH covers the fixed payout plus fees (excess becomes
   // change). Retry with a bigger buffer if the first target leaves no change.
+  // The platform fee payout is rebuilt per attempt because it is a share of
+  // the trade demand, which grows with each buffer step.
   let trade = null;
   let tradeTx = null;
   let lastError = null;
   for (const buffer of [2000n, 20000n, 100000n]) {
     try {
       trade = attemptTrade({ pools, isBuyingToken: false, supply: undefined, demand: amountSats + buffer });
+      const payoutRules = [
+        { type: PayoutAmountRuleType.FIXED, locking_bytecode: payToDecoded.bytecode, amount: amountSats },
+      ];
+      const platformFeeSats = computePlatformFeeSats(platformFee, trade);
+      if (platformFeeSats > 0n && platformFeeBytecode) {
+        payoutRules.push({ type: PayoutAmountRuleType.FIXED, locking_bytecode: platformFeeBytecode, amount: platformFeeSats });
+      }
+      payoutRules.push({ type: PayoutAmountRuleType.CHANGE, locking_bytecode: changeDecoded.bytecode, allow_mixing_native_and_token: false, allow_mixing_native_and_token_when_bch_change_is_dust: false, add_change_to_txfee_when_bch_change_is_dust: true });
       tradeTx = exlab.createTradeTx(trade.entries, spendableCoins, payoutRules, null, 1n);
       exlab.verifyTradeTx(tradeTx);
       break;
