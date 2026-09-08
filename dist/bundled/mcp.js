@@ -183,20 +183,28 @@ const FAQ = [
 // Appended to Paytaca AI info tool outputs (plans, credits, models): asks the
 // user what they want to do next and steers them toward buying a plan, with
 // concrete example prompts they can reuse to place the order.
-async function nextSteps() {
+async function nextSteps(forPlans = false) {
   const percent = await getLiftDiscountPercent();
   const liftLine = percent > 0
     ? '- Pay with LIFT instead of BCH for a discount: add "pay with LIFT" to your buy request, e.g. "Buy 30 minutes of GLM 5.3 Flash and pay with LIFT." — you get **' + percent + '% off**.'
     : '- Pay with LIFT instead of BCH: add "pay with LIFT" to your buy request, e.g. "Buy 30 minutes of GLM 5.3 Flash and pay with LIFT."';
-  return [
+  const steps = [
     '',
     'What would you like to do next?',
     '- Buy a plan in one go: say something like "Buy 30 minutes of GLM 5.3 Flash and pay with BCH" — swap in any model, duration, and payment method from the list above.',
     '- Guided purchase: just prompt "buy plan" and a guided purchase with questions will be activated.',
     liftLine,
     '- Check your credits: "How much time do I have left?"',
-    '- See prices for another model: "Show me the plans for <model>."',
-  ].join('\\n');
+  ];
+  if (forPlans) {
+    steps.push(
+      'Want to buy one? Say something like "Buy 30 minutes of DeepSeek V4 Flash, pay with BCH" or "pay with LIFT" for 10% off.',
+      'Alternatively, say something like "buy plan" to trigger the guided purchase flow to select model, plan, and payment method.'
+    );
+  } else {
+    steps.push('- See prices for another model: "Show me the plans for <model>."');
+  }
+  return steps.join('\\n');
 }
 
 // Remaining time credits per model session
@@ -290,7 +298,7 @@ async function getPlans(filterModel) {
     });
   }
   if (models.length === 0) {
-    return 'No models available.' + await nextSteps();
+    return 'No models available.' + await nextSteps(true);
   }
   const lines = [];
   for (const m of models) {
@@ -317,7 +325,7 @@ async function getPlans(filterModel) {
   }
   lines.push('');
   lines.push('IMPORTANT: In your reply to the user, copy the pricing tables above VERBATIM as markdown tables. Do NOT summarize them into one-line lists — the user cannot see this tool output, only your reply.');
-  return lines.join('\\n') + await nextSteps();
+  return lines.join('\\n') + await nextSteps(true);
 }
 
 // Resolve a model (by id or display name) and its price tier by minutes.
