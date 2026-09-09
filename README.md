@@ -15,6 +15,9 @@ An [OpenCode](https://opencode.ai) plugin that connects to **Paytaca AI** — an
 - **Node.js** >= 20.0.0
 - **OpenCode** >= 1.0.0
 
+Paying plans with LIFT tokens requires **paytaca-cli** >= 0.5.0 (bundled and
+installed automatically).
+
 ## Installation
 
 ```bash
@@ -78,6 +81,17 @@ the assistant can quote the current percent via `get_help` or `get_plans`).
 You can't buy a plan while the model still has active credits — spending would
 charge nothing and time doesn't stack, so use up or wait out remaining credits
 before buying again.
+
+Paying with LIFT sells tokens on the Cauldron DEX, which charges the DEX trade
+fee plus a Paytaca platform fee (0.3% of the BCH side of the swap, capped at
+$1; skipped when it would be below the 546-sat dust threshold). These are
+covered by the LIFT sold, so slightly more LIFT is spent than the plan price
+alone.
+
+Before broadcasting any plan purchase, the plugin probes the backend plan
+endpoint several times and aborts with no payment if it looks unstable or the
+quoted price changes mid-purchase. Set `PAYTACA_PLAN_PROBE=0` to disable this
+safety check.
 
 ### Auto-refilling a plan
 
