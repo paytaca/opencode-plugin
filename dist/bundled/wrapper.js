@@ -65,12 +65,13 @@ async function probePlanStability(url, headers) {
       if (!res.ok) { lastError = 'HTTP ' + res.status; continue; }
       const data = await res.json();
       const models = Array.isArray(data.models) ? data.models : [];
-      const model = models.find(function (m) {
-        const id = String(m.id || '').toLowerCase();
-        const name = String(m.display_name || '').toLowerCase();
-        const q = String(modelId).toLowerCase();
-        return id.indexOf(q) !== -1 || name.indexOf(q) !== -1;
-      });
+      const q = String(modelId).toLowerCase();
+      const model = models.find(function (m) { return String(m.id || '').toLowerCase() === q; })
+        || models.find(function (m) {
+          const id = String(m.id || '').toLowerCase();
+          const name = String(m.display_name || '').toLowerCase();
+          return id.indexOf(q) !== -1 || name.indexOf(q) !== -1;
+        });
       if (!model) { lastError = 'model ' + modelId + ' not in plan config'; continue; }
       const tiers = Array.isArray(model.price_tiers) ? model.price_tiers : [];
       const tier = tiers.find(function (t) { return Number(t.minutes) === Number(minutes); });

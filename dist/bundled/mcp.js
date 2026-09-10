@@ -307,6 +307,7 @@ async function getPlans(filterModel) {
     const tierInName = tier && name.toLowerCase().indexOf(tier.toLowerCase()) !== -1;
     if (lines.length > 0) lines.push('');
     lines.push('**' + name + (tier && !tierInName ? ' (' + tier + ')' : '') + '**');
+    lines.push('Model ID: \`' + m.id + '\`');
     lines.push('');
     const tiers = Array.isArray(m.price_tiers) ? m.price_tiers : [];
     if (tiers.length === 0) {
@@ -324,7 +325,7 @@ async function getPlans(filterModel) {
     }
   }
   lines.push('');
-  lines.push('IMPORTANT: In your reply to the user, copy the pricing tables above VERBATIM as markdown tables. Do NOT summarize them into one-line lists — the user cannot see this tool output, only your reply.');
+  lines.push('IMPORTANT: In your reply to the user, copy the pricing tables above VERBATIM as markdown tables. Do NOT summarize them into one-line lists — the user cannot see this tool output, only your reply. When the user asks to buy a plan, use the exact Model ID from the table above as the \`model\` parameter for \`buy_plan\`.');
   return lines.join('\\n') + await nextSteps(true);
 }
 
@@ -741,7 +742,7 @@ const TOOLS = [
       type: 'object',
       required: ['model', 'minutes', 'payment_method'],
       properties: {
-        model: { type: 'string', description: 'Model id or display name, e.g. deepseek/deepseek-v4-flash or DeepSeek V4 Flash.' },
+        model: { type: 'string', description: 'Model ID for the plan (use the exact Model ID shown in get_plans output), e.g. z-ai/glm-5.3-flash. Display names are also accepted for convenience.' },
         minutes: { type: 'number', description: 'Plan duration in minutes, e.g. 30 for the 30-minute tier.' },
         payment_method: { type: 'string', enum: ['bch', 'lift'], description: 'Payment method. bch (default) pays from the BCH balance. Set to lift when the user says "pay with LIFT" or "pay with LIFT tokens" — this sells the wallet LIFT token balance via Cauldron to fund the plan. Use lift when the wallet lacks BCH but holds LIFT, or when the user explicitly asks to pay with LIFT.' },
       },
@@ -755,7 +756,7 @@ const TOOLS = [
       required: ['enabled'],
       properties: {
         enabled: { type: 'boolean', description: 'Arm (true) or disarm (false) automatic refills.' },
-        model: { type: 'string', description: 'Model id or display name to auto-refill (required when enabling), e.g. deepseek/deepseek-v4-flash.' },
+        model: { type: 'string', description: 'Model ID to auto-refill (required when enabling), e.g. z-ai/glm-5.3-flash. Use the exact Model ID from get_plans output.' },
         minutes: { type: 'number', description: 'Plan size in minutes bought per refill (required when enabling), e.g. 15.' },
         max_minutes: { type: 'number', description: 'Maximum total minutes to auto-buy across all refills (required when enabling), e.g. 120 for a 2-hour cap.' },
         payment_method: { type: 'string', enum: ['bch', 'lift'], description: 'Payment method for each refill. Default bch. Set to lift when the user wants to pay with LIFT tokens (discount applies).' },
